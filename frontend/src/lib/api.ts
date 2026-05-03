@@ -6,6 +6,20 @@ type TokenResponse = {
   user_id: string;
 };
 
+type WebSocketTicketResponse = {
+  ticket: string;
+  expires_in_seconds: number;
+};
+
+const readErrorMessage = async (response: Response, fallback: string) => {
+  try {
+    const payload = (await response.json()) as { detail?: string };
+    return payload.detail ?? fallback;
+  } catch {
+    return fallback;
+  }
+};
+
 export const login = async (
   apiUrl: string,
   username: string,
@@ -18,10 +32,39 @@ export const login = async (
   });
 
   if (!response.ok) {
-    throw new Error(`Login failed with status ${response.status}`);
+    throw new Error(await readErrorMessage(response, `Login failed with status ${response.status}`));
   }
 
   return (await response.json()) as TokenResponse;
+};
+
+export const logout = async (apiUrl: string, token: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/auth/logout`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok && response.status !== 204) {
+    throw new Error(await readErrorMessage(response, `Logout failed with status ${response.status}`));
+  }
+};
+
+export const fetchWsTicket = async (
+  apiUrl: string,
+  token: string,
+): Promise<WebSocketTicketResponse> => {
+  const response = await fetch(`${apiUrl}/api/auth/ws-ticket`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `WebSocket ticket failed with status ${response.status}`),
+    );
+  }
+
+  return (await response.json()) as WebSocketTicketResponse;
 };
 
 export const fetchBootstrap = async (apiUrl: string, token: string) => {
@@ -29,7 +72,7 @@ export const fetchBootstrap = async (apiUrl: string, token: string) => {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
-    throw new Error(`Bootstrap request failed with status ${response.status}`);
+    throw new Error(await readErrorMessage(response, `Bootstrap request failed with status ${response.status}`));
   }
 
   return (await response.json()) as BootstrapResponse;
@@ -44,7 +87,7 @@ export const fetchHistory = async (
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
-    throw new Error(`History request failed with status ${response.status}`);
+    throw new Error(await readErrorMessage(response, `History request failed with status ${response.status}`));
   }
 
   return (await response.json()) as ChatHistoryResponse;
@@ -67,7 +110,7 @@ export const fetchPrekeyBundle = async (
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
-    throw new Error(`Prekey bundle request failed with status ${response.status}`);
+    throw new Error(await readErrorMessage(response, `Prekey bundle request failed with status ${response.status}`));
   }
   return (await response.json()) as PrekeyBundle;
 };
@@ -78,7 +121,7 @@ export const uploadIdentityKeys = async (
   identityKeyPub: string,
   signedPrekeyPub: string,
 ): Promise<void> => {
-  await fetch(`${apiUrl}/api/keys/identity`, {
+  const response = await fetch(`${apiUrl}/api/keys/identity`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -89,4 +132,10 @@ export const uploadIdentityKeys = async (
       signed_prekey_pub: signedPrekeyPub,
     }),
   });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Identity key upload failed with status ${response.status}`),
+    );
+  }
 };

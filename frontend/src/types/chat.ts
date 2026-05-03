@@ -84,6 +84,7 @@ export type BootstrapUser = {
   username: string;
   display_name: string;
   initials: string;
+  presence_state: 'online' | 'offline';
 };
 
 export type BootstrapChatMember = {
@@ -91,6 +92,7 @@ export type BootstrapChatMember = {
   username: string;
   display_name: string;
   initials: string;
+  presence_state: 'online' | 'offline';
 };
 
 export type BootstrapChat = {

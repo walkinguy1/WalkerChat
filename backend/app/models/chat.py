@@ -24,7 +24,7 @@ class Chat(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     type = Column(SQLEnum(ChatType), default=ChatType.DIRECT)
-    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
 
 
 class ChatMember(Base):
@@ -46,4 +46,4 @@ class Message(Base):
     is_media = Column(Boolean, default=False)
 
     status = Column(SQLEnum(MessageStatus), default=MessageStatus.SENT)
-    sent_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    sent_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))

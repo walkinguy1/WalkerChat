@@ -1,6 +1,6 @@
 # WalkerChat
 
-WalkerChat is a scalable E2EE (End-to-End Encrypted) communication platform featuring messaging, WebRTC calling capabilities, and secure media storage.
+WalkerChat is a realtime chat platform featuring encrypted message storage, WebRTC signaling hooks, and secure media storage scaffolding.
 
 For the full working guide covering setup, architecture, event contracts, extension patterns, and verification, see `INSTRUCTIONS.md`.
 
@@ -13,11 +13,17 @@ Before your first push:
 3. Review `.gitignore` and confirm `node_modules`, local env files, logs, caches, and service data are not being committed.
 
 ## Features
-- Signal Protocol E2EE (X3DH & Double Ratchet) 
+- Experimental client-side key exchange and AES-GCM message envelopes
 - Persistent WebSockets using Redis Pub/Sub
 - Encrypted Media Uploads to MinIO (S3-compatible)
 - WebRTC Peer-to-Peer AV signaling
 - Background tasks scaling using Celery
+
+## Security Status
+
+- Message bodies are stored as ciphertext, not plaintext.
+- The current client crypto path is still an experimental demo and is not a full Signal Protocol implementation.
+- Do not market or ship this as production-grade Signal-style E2EE until Double Ratchet, proper session lifecycle, and key management are actually implemented.
 
 ## Directory Structure
 - `/backend`: FastAPI (Async), SQLAlchemy, Alembic, Celery.

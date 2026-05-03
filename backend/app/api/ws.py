@@ -12,10 +12,19 @@ from app.schemas.chat import ChatMessageEvent, ErrorEvent, TypingEvent, realtime
 from app.services.chat import (
     build_presence_events,
     persist_chat_message,
+    set_presence_state,
     validate_typing_event,
 )
 
 router = APIRouter()
+
+
+def _naive_utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo else value
 
 
 @router.websocket("/chat")
@@ -27,6 +36,7 @@ async def websocket_endpoint(
     is_first_connection = await manager.connect(websocket, user_id_str)
 
     if is_first_connection:
+        await set_presence_state(user_id, "online")
         async with SessionLocal() as session:
             presence_events = await build_presence_events(
                 session, user_id=user_id, state="online"
@@ -55,7 +65,7 @@ async def websocket_endpoint(
                 continue
 
             event = event.model_copy(
-                update={"sent_at": event.sent_at or datetime.now(UTC)}
+                update={"sent_at": _to_naive_utc(event.sent_at or _naive_utc_now())}
             )
 
             if isinstance(event, ChatMessageEvent):
@@ -94,6 +104,7 @@ async def websocket_endpoint(
     except WebSocketDisconnect:
         is_last_connection = manager.disconnect(websocket, user_id_str)
         if is_last_connection:
+            await set_presence_state(user_id, "offline")
             async with SessionLocal() as session:
                 presence_events = await build_presence_events(
                     session, user_id=user_id, state="offline"

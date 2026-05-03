@@ -5,6 +5,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.runtime_state import get_runtime_value, set_runtime_value
 from app.core.security import hash_password
 from app.models import Chat, ChatMember, ChatType, Message, User
 from app.schemas.chat import (
@@ -26,6 +27,14 @@ DEMO_DISPLAY_NAMES = {
 DEMO_CHAT_NAME = "Engineering Sync"
 DEMO_CHAT_SUMMARY = "Encrypted delivery, live presence, and typing signals."
 DEMO_PASSWORD = "walkerchat123"
+
+
+def _naive_utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    return value.astimezone(UTC).replace(tzinfo=None) if value.tzinfo else value
 
 
 def _build_initials(display_name: str) -> str:
@@ -55,8 +64,8 @@ async def seed_demo_data(session: AsyncSession) -> None:
                 id=settings.demo_alice_id,
                 username="alice",
                 password_hash=hash_password(DEMO_PASSWORD),
-                identity_key_pub="alice-identity-key",
-                signed_prekey_pub="alice-signed-prekey",
+                identity_key_pub="pending-client-upload",
+                signed_prekey_pub="pending-client-upload",
             )
         )
 
@@ -66,8 +75,8 @@ async def seed_demo_data(session: AsyncSession) -> None:
                 id=settings.demo_bob_id,
                 username="bob",
                 password_hash=hash_password(DEMO_PASSWORD),
-                identity_key_pub="bob-identity-key",
-                signed_prekey_pub="bob-signed-prekey",
+                identity_key_pub="pending-client-upload",
+                signed_prekey_pub="pending-client-upload",
             )
         )
 
@@ -129,7 +138,7 @@ async def persist_chat_message(
         chat_id=event.chat_id,
         sender_id=event.sender_id,
         encrypted_payload=event.ciphertext,
-        sent_at=event.sent_at or datetime.now(UTC),
+        sent_at=_to_naive_utc(event.sent_at or _naive_utc_now()),
     )
     session.add(message)
     await session.commit()
@@ -154,7 +163,7 @@ async def get_recent_messages(
             await session.execute(
                 select(Message)
                 .where(Message.chat_id == chat_id)
-                .order_by(desc(Message.sent_at))
+                .order_by(desc(Message.sent_at), desc(Message.id))
                 .limit(limit)
             )
         )
@@ -204,6 +213,11 @@ async def get_bootstrap_data(session: AsyncSession) -> BootstrapResponse:
             username=user.username,
             display_name=_display_name_for_user(user),
             initials=_build_initials(_display_name_for_user(user)),
+            presence_state=(
+                "online"
+                if await get_runtime_value(f"presence:{user.id}") == "online"
+                else "offline"
+            ),
         )
         for user in users
     ]
@@ -215,6 +229,11 @@ async def get_bootstrap_data(session: AsyncSession) -> BootstrapResponse:
                 username=user.username,
                 display_name=_display_name_for_user(user),
                 initials=_build_initials(_display_name_for_user(user)),
+                presence_state=(
+                    "online"
+                    if await get_runtime_value(f"presence:{user.id}") == "online"
+                    else "offline"
+                ),
             )
             for user in users
         ],
@@ -251,7 +270,11 @@ async def build_presence_events(
             user_id=user_id,
             target_id=target_id,
             state=state,
-            sent_at=datetime.utcnow(),
+            sent_at=datetime.now(UTC),
         )
         for chat_id, target_id in peer_rows
     ]
+
+
+async def set_presence_state(user_id: UUID, state: str) -> None:
+    await set_runtime_value(f"presence:{user_id}", state)

@@ -1,7 +1,7 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,8 +21,34 @@ class PrekeyBundleResponse(BaseModel):
     one_time_prekey_id: str | None = None
 
 
+class UploadPrekeyItem(BaseModel):
+    key_id: str = Field(min_length=1, max_length=128)
+    public_key: str = Field(min_length=16, max_length=4096)
+
+    @field_validator("key_id", "public_key")
+    @classmethod
+    def no_blank_values(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Value cannot be blank.")
+        return stripped
+
+
 class UploadOPKsRequest(BaseModel):
-    prekeys: list[dict]  # [{key_id: str, public_key: str}, ...]
+    prekeys: list[UploadPrekeyItem] = Field(min_length=1, max_length=100)
+
+
+class UpdateIdentityKeysRequest(BaseModel):
+    identity_key_pub: str = Field(min_length=16, max_length=4096)
+    signed_prekey_pub: str = Field(min_length=16, max_length=4096)
+
+    @field_validator("identity_key_pub", "signed_prekey_pub")
+    @classmethod
+    def validate_key_material(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Key material cannot be blank.")
+        return stripped
 
 
 @router.get("/{target_user_id}/bundle", response_model=PrekeyBundleResponse)
@@ -79,8 +105,8 @@ async def upload_opks(
         session.add(
             OneTimePreKey(
                 user_id=current_user.id,
-                key_id=pk["key_id"],
-                public_key=pk["public_key"],
+                key_id=pk.key_id,
+                public_key=pk.public_key,
             )
         )
     await session.commit()
@@ -89,14 +115,12 @@ async def upload_opks(
 
 @router.put("/identity", status_code=status.HTTP_200_OK)
 async def update_identity_keys(
-    body: dict,
+    body: UpdateIdentityKeysRequest,
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict:
     """Update identity and signed prekeys for the current user."""
-    if "identity_key_pub" in body:
-        current_user.identity_key_pub = body["identity_key_pub"]
-    if "signed_prekey_pub" in body:
-        current_user.signed_prekey_pub = body["signed_prekey_pub"]
+    current_user.identity_key_pub = body.identity_key_pub
+    current_user.signed_prekey_pub = body.signed_prekey_pub
     await session.commit()
     return {"status": "updated"}

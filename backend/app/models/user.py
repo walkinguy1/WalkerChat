@@ -18,4 +18,4 @@ class User(Base):
     identity_key_pub = Column(String, nullable=False)
     signed_prekey_pub = Column(String, nullable=False)
 
-    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))

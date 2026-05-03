@@ -93,6 +93,7 @@ class DemoUserProfile(BaseModel):
     username: str
     display_name: str
     initials: str
+    presence_state: Literal["online", "offline"] = "offline"
 
 
 class DemoChatMember(BaseModel):
@@ -100,6 +101,7 @@ class DemoChatMember(BaseModel):
     username: str
     display_name: str
     initials: str
+    presence_state: Literal["online", "offline"] = "offline"
 
 
 class DemoChatSummary(BaseModel):

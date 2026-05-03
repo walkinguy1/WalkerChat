@@ -11,6 +11,7 @@ from app.api.keys import router as keys_router
 from app.api.ws import router as ws_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_database
+from app.core.runtime_state import close_runtime_redis
 from app.core.ws_manager import manager
 from app.services.chat import seed_demo_data
 
@@ -29,6 +30,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await manager.shutdown()
+        await close_runtime_redis()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

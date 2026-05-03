@@ -12,7 +12,7 @@ WalkerChat is a secure chat platform with:
 - Redis Pub/Sub for cross-instance WebSocket delivery
 - WebSockets for realtime chat and signaling
 - WebRTC reserved for voice/video signaling
-- E2EE direction based on Signal Protocol concepts
+- E2EE direction based on Signal Protocol concepts, but not yet a full Signal implementation
 
 ## 2. Current State
 
@@ -29,8 +29,9 @@ The app currently includes:
 Important:
 
 - Messages are stored as ciphertext only
-- The current frontend crypto is a demo encrypted envelope, not a full Signal implementation yet
+- The current frontend crypto is an experimental demo path, not a full Signal implementation yet
 - The backend contract is shaped so a real Signal layer can replace the demo encryption later
+- Do not describe the current build as having production-ready Signal Protocol E2EE
 
 ## 3. Project Rules
 
