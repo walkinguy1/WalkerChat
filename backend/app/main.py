@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.auth import router as auth_router
 from app.api.bootstrap import router as bootstrap_router
 from app.api.chats import router as chat_router
+from app.api.keys import router as keys_router
 from app.api.ws import router as ws_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_database
@@ -39,8 +41,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(bootstrap_router)
 app.include_router(chat_router)
+app.include_router(keys_router)
 app.include_router(ws_router, prefix="/api/ws", tags=["websocket"])
 
 

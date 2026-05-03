@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 class EncryptionMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    algorithm: Literal["signal-compatible-demo"] = "signal-compatible-demo"
+    algorithm: str = "aes-256-gcm"
     version: int = 1
     key_id: str = "local-device"
 

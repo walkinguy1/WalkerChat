@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { fetchBootstrap, fetchHistory } from './lib/api';
+import { fetchBootstrap, fetchHistory, fetchPrekeyBundle, login, uploadIdentityKeys } from './lib/api';
 import { mergeMessages, toDisplayMessage } from './lib/chat';
-import { encryptMessage } from './lib/crypto';
+import {
+  clearAllSessions,
+  encryptMessage,
+  generateKeyPair,
+  getOrCreateSession,
+  type KeyBundle,
+} from './lib/crypto';
 import { useWebSocket } from './hooks/useWebSocket';
 import type {
   BootstrapChat,
@@ -29,6 +35,9 @@ const App = () => {
     {},
   );
   const typingTimeoutRef = useRef<number | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [myKeys, setMyKeys] = useState<KeyBundle | null>(null);
+  const [sessionAesKey, setSessionAesKey] = useState<CryptoKey | null>(null);
 
   const currentUser = useMemo<BootstrapUser | null>(
     () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
@@ -44,7 +53,9 @@ const App = () => {
     [activeChat, currentUser?.id],
   );
 
-  const socketUrl = currentUser ? `${wsBaseUrl}/api/ws/chat/${currentUser.id}` : null;
+  const socketUrl = currentUser && authToken
+    ? `${wsBaseUrl}/api/ws/chat?token=${encodeURIComponent(authToken)}`
+    : null;
 
   const { connectionState, sendMessage } = useWebSocket<RealtimeEvent>(socketUrl, {
     onMessage: (message) => {
@@ -91,7 +102,7 @@ const App = () => {
       setBootstrapState('loading');
 
       try {
-        const payload = await fetchBootstrap(apiUrl);
+        const payload = await fetchBootstrap(apiUrl, authToken!);
         if (!isActive) {
           return;
         }
@@ -116,7 +127,7 @@ const App = () => {
     return () => {
       isActive = false;
     };
-  }, []);
+  }, [authToken]);
 
   useEffect(() => {
     if (!activeChat || !currentUser) {
@@ -132,7 +143,7 @@ const App = () => {
       setHistoryState('loading');
 
       try {
-        const payload = await fetchHistory(apiUrl, activeChat.id, currentUser.id);
+        const payload = await fetchHistory(apiUrl, activeChat.id, authToken!);
         if (!isActive) {
           return;
         }
@@ -153,6 +164,37 @@ const App = () => {
       isActive = false;
     };
   }, [activeChat, currentUser]);
+
+  // Establish E2EE session when peer changes
+  useEffect(() => {
+    if (!peer || !myKeys || !authToken) {
+      return;
+    }
+
+    let isActive = true;
+
+    const establishSession = async () => {
+      try {
+        const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
+        const session = await getOrCreateSession(
+          peer.user_id,
+          bundle.signed_prekey_pub,
+          myKeys,
+        );
+        if (isActive) {
+          setSessionAesKey(session.sharedKey);
+        }
+      } catch (error) {
+        console.error('Failed to establish E2EE session', error);
+      }
+    };
+
+    void establishSession();
+
+    return () => {
+      isActive = false;
+    };
+  }, [peer?.user_id, myKeys, authToken]);
 
   useEffect(() => {
     if (!activeChat || !currentUser || !peer) {
@@ -212,7 +254,7 @@ const App = () => {
     }
   }, [connectionState]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (!activeChat || !currentUser || !peer) {
       return;
     }
@@ -222,15 +264,18 @@ const App = () => {
       return;
     }
 
+    // Encrypt with AES-GCM if session is established, else fallback
+    const ciphertext = await encryptMessage(trimmedDraft, sessionAesKey ?? undefined);
+
     const outboundMessage: ChatMessageEvent = {
       type: 'chat_message',
       chat_id: activeChat.id,
       client_message_id: crypto.randomUUID(),
       sender_id: currentUser.id,
       target_id: peer.user_id,
-      ciphertext: encryptMessage(trimmedDraft),
+      ciphertext,
       encryption: {
-        algorithm: 'signal-compatible-demo',
+        algorithm: sessionAesKey ? 'aes-256-gcm' : 'signal-compatible-demo',
         version: 1,
         key_id: `${currentUser.username}-primary-device`,
       },
@@ -300,17 +345,40 @@ const App = () => {
                 <button
                   key={user.id}
                   type="button"
-                  onClick={() => {
-                    setSelectedUserId(user.id);
+                  onClick={async () => {
+                    try {
+                      // 1. Login
+                      const tokenData = await login(apiUrl, user.username, 'walkerchat123');
+                      setAuthToken(tokenData.access_token);
+                      setSelectedUserId(tokenData.user_id);
+
+                      // 2. Generate ECDH keypair
+                      const keys = await generateKeyPair();
+                      setMyKeys(keys);
+
+                      // 3. Upload public keys to server
+                      await uploadIdentityKeys(
+                        apiUrl,
+                        tokenData.access_token,
+                        keys.publicKeyBase64,
+                        keys.publicKeyBase64,
+                      );
+
+                      // 4. Clear old sessions
+                      clearAllSessions();
+                      setSessionAesKey(null);
+                    } catch (err) {
+                      console.error('Login failed', err);
+                      setErrorNotice('Login failed. Check backend.');
+                    }
                     setDraft('');
                     setTypingUserId(null);
                     setErrorNotice(null);
                   }}
-                  className={`flex items-center gap-3 rounded-[1.2rem] border px-4 py-3 text-left transition ${
-                    selectedUserId === user.id
-                      ? 'border-cyan-300/70 bg-cyan-400/15 text-white'
-                      : 'border-white/10 bg-slate-950/60 text-slate-300 hover:border-white/20'
-                  }`}
+                  className={`flex items-center gap-3 rounded-[1.2rem] border px-4 py-3 text-left transition ${selectedUserId === user.id
+                    ? 'border-cyan-300/70 bg-cyan-400/15 text-white'
+                    : 'border-white/10 bg-slate-950/60 text-slate-300 hover:border-white/20'
+                    }`}
                 >
                   <span className="flex h-11 w-11 items-center justify-center rounded-full bg-slate-900 text-sm font-semibold text-cyan-200">
                     {user.initials}
@@ -361,9 +429,8 @@ const App = () => {
                     </span>
                     <span className="flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-slate-400">
                       <span
-                        className={`h-2.5 w-2.5 rounded-full ${
-                          presence === 'online' ? 'bg-emerald-400' : 'bg-slate-600'
-                        }`}
+                        className={`h-2.5 w-2.5 rounded-full ${presence === 'online' ? 'bg-emerald-400' : 'bg-slate-600'
+                          }`}
                       />
                       {presence}
                     </span>
@@ -389,9 +456,8 @@ const App = () => {
 
             <div className="flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-300">
               <span
-                className={`h-2.5 w-2.5 rounded-full ${
-                  connectionState === 'open' ? 'bg-emerald-400' : 'bg-amber-300'
-                }`}
+                className={`h-2.5 w-2.5 rounded-full ${connectionState === 'open' ? 'bg-emerald-400' : 'bg-amber-300'
+                  }`}
               />
               <span>{connectionLabel}</span>
             </div>
@@ -420,17 +486,15 @@ const App = () => {
                     className={`flex ${isCurrentUser ? 'justify-end' : 'justify-start'}`}
                   >
                     <article
-                      className={`max-w-xl rounded-[1.5rem] px-4 py-3 shadow-lg ${
-                        isCurrentUser
-                          ? 'rounded-tr-md bg-cyan-500 text-slate-950'
-                          : 'rounded-tl-md border border-white/10 bg-white/5 text-slate-100'
-                      }`}
+                      className={`max-w-xl rounded-[1.5rem] px-4 py-3 shadow-lg ${isCurrentUser
+                        ? 'rounded-tr-md bg-cyan-500 text-slate-950'
+                        : 'rounded-tl-md border border-white/10 bg-white/5 text-slate-100'
+                        }`}
                     >
                       <p className="text-sm leading-6">{message.body}</p>
                       <div
-                        className={`mt-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] ${
-                          isCurrentUser ? 'text-slate-900/60' : 'text-slate-400'
-                        }`}
+                        className={`mt-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] ${isCurrentUser ? 'text-slate-900/60' : 'text-slate-400'
+                          }`}
                       >
                         <span>{new Date(message.sentAt).toLocaleTimeString()}</span>
                         <span>{message.state}</span>

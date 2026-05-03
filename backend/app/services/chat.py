@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.security import hash_password
 from app.models import Chat, ChatMember, ChatType, Message, User
 from app.schemas.chat import (
     BootstrapResponse,
@@ -24,6 +25,7 @@ DEMO_DISPLAY_NAMES = {
 }
 DEMO_CHAT_NAME = "Engineering Sync"
 DEMO_CHAT_SUMMARY = "Encrypted delivery, live presence, and typing signals."
+DEMO_PASSWORD = "walkerchat123"
 
 
 def _build_initials(display_name: str) -> str:
@@ -52,6 +54,7 @@ async def seed_demo_data(session: AsyncSession) -> None:
             User(
                 id=settings.demo_alice_id,
                 username="alice",
+                password_hash=hash_password(DEMO_PASSWORD),
                 identity_key_pub="alice-identity-key",
                 signed_prekey_pub="alice-signed-prekey",
             )
@@ -62,6 +65,7 @@ async def seed_demo_data(session: AsyncSession) -> None:
             User(
                 id=settings.demo_bob_id,
                 username="bob",
+                password_hash=hash_password(DEMO_PASSWORD),
                 identity_key_pub="bob-identity-key",
                 signed_prekey_pub="bob-signed-prekey",
             )
@@ -125,7 +129,7 @@ async def persist_chat_message(
         chat_id=event.chat_id,
         sender_id=event.sender_id,
         encrypted_payload=event.ciphertext,
-        timestamp=event.sent_at or datetime.utcnow(),
+        sent_at=event.sent_at or datetime.now(UTC),
     )
     session.add(message)
     await session.commit()
@@ -138,7 +142,7 @@ async def persist_chat_message(
         ciphertext=message.encrypted_payload,
         status=message.status.value,
         is_media=message.is_media,
-        sent_at=message.timestamp,
+        sent_at=message.sent_at,
     )
 
 
@@ -150,7 +154,7 @@ async def get_recent_messages(
             await session.execute(
                 select(Message)
                 .where(Message.chat_id == chat_id)
-                .order_by(desc(Message.timestamp))
+                .order_by(desc(Message.sent_at))
                 .limit(limit)
             )
         )
@@ -166,7 +170,7 @@ async def get_recent_messages(
             ciphertext=message.encrypted_payload,
             status=message.status.value,
             is_media=message.is_media,
-            sent_at=message.timestamp,
+            sent_at=message.sent_at,
         )
         for message in reversed(rows)
     ]

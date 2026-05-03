@@ -1,5 +1,5 @@
 export type EncryptionMetadata = {
-  algorithm: 'signal-compatible-demo';
+  algorithm: string;
   version: number;
   key_id: string;
 };

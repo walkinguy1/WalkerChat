@@ -24,6 +24,11 @@ class Settings(BaseSettings):
         ]
     )
 
+    # JWT
+    jwt_secret: str = "change-this-jwt-secret-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expiry_minutes: int = 60
+
     demo_chat_id: UUID = UUID("11111111-1111-1111-1111-111111111111")
     demo_alice_id: UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     demo_bob_id: UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")

@@ -1,11 +1,12 @@
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from app.core.database import SessionLocal
+from app.core.security import get_ws_user
 from app.core.ws_manager import manager
 from app.schemas.chat import ChatMessageEvent, ErrorEvent, TypingEvent, realtime_event_adapter
 from app.services.chat import (
@@ -17,8 +18,11 @@ from app.services.chat import (
 router = APIRouter()
 
 
-@router.websocket("/chat/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: UUID) -> None:
+@router.websocket("/chat")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user_id: UUID = Depends(get_ws_user),
+) -> None:
     user_id_str = str(user_id)
     is_first_connection = await manager.connect(websocket, user_id_str)
 
@@ -51,7 +55,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: UUID) -> None:
                 continue
 
             event = event.model_copy(
-                update={"sent_at": event.sent_at or datetime.utcnow()}
+                update={"sent_at": event.sent_at or datetime.now(UTC)}
             )
 
             if isinstance(event, ChatMessageEvent):
