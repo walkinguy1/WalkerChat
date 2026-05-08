@@ -41,13 +41,14 @@ services:
       - minio
     environment:
       DEBUG: ${DEBUG:-True}
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://walker:change-this-postgres-password@postgres:5432/walkerchat}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      # Keep container-internal service hosts fixed for Docker networking.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-walker}:${POSTGRES_PASSWORD:-change-this-postgres-password}@postgres:5432/${POSTGRES_DB:-walkerchat}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-change-this-minio-password}
-      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
-      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
 
   celery_worker:
     build:
@@ -59,9 +60,9 @@ services:
       - redis
       - postgres
     environment:
-      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/1}
-      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
-      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://walker:change-this-postgres-password@postgres:5432/walkerchat}
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-walker}:${POSTGRES_PASSWORD:-change-this-postgres-password}@postgres:5432/${POSTGRES_DB:-walkerchat}
 
   frontend:
     build:

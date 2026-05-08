@@ -1,58 +1,23 @@
-# WalkerChat Instructions
+# WalkerChat - Complete Beginner's Guide
 
-This file is the working guide for building, running, extending, and reviewing WalkerChat.
+## 🚀 Quick Start (Zero Experience Required)
 
-## 1. What This Project Is
+### Prerequisites
+- **Docker** (installed on your system)
+- **Git** (for cloning the repository)
+- **Modern web browser** (Chrome, Firefox, Safari, Edge)
 
-WalkerChat is a secure chat platform with:
+### Step 1: Clone and Setup
+```bash
+# Clone the repository
+git clone <repository-url>
+cd walkerchat
 
-- FastAPI backend using asynchronous endpoints only
-- React + Vite frontend
-- PostgreSQL for encrypted message persistence
-- Redis Pub/Sub for cross-instance WebSocket delivery
-- WebSockets for realtime chat and signaling
-- WebRTC reserved for voice/video signaling
-- E2EE direction based on Signal Protocol concepts, but not yet a full Signal implementation
+# Copy environment file
+cp .env.example .env
 
-## 2. Current State
-
-The app currently includes:
-
-- Demo bootstrap endpoint that returns seeded users and chats
-- Realtime encrypted chat message delivery
-- Encrypted payload persistence in PostgreSQL
-- Demo identity switching in the UI
-- Presence updates on connect/disconnect
-- Typing indicators over WebSockets
-- Redis-backed fanout for horizontal scaling
-
-Important:
-
-- Messages are stored as ciphertext only
-- The current frontend crypto is an experimental demo path, not a full Signal implementation yet
-- The backend contract is shaped so a real Signal layer can replace the demo encryption later
-- Do not describe the current build as having production-ready Signal Protocol E2EE
-
-## 3. Project Rules
-
-These must stay true:
-
-- All API endpoints must be async
-- Use Pydantic v2 models for validation
-- Use WebSockets for messaging
-- Use WebRTC signaling for calls
-- Do not store plain-text messages in the database
-- Design realtime delivery so multiple backend instances can work together through Redis
-
-## 4. Repository Layout
-
-- `backend/app/main.py`
-  App startup, lifespan, router registration, DB init
-- `backend/app/api/bootstrap.py`
-  Bootstrap API for demo users and chats
-- `backend/app/api/chats.py`
-  Chat history API
-- `backend/app/api/ws.py`
+# Start all services with Docker
+docker-compose up -d
   WebSocket chat endpoint and realtime event handling
 - `backend/app/core/config.py`
   Central settings

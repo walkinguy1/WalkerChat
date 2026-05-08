@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
 from app.core.database import SessionLocal
+from app.core.rate_limiter import WebSocketRateLimiter
 from app.core.security import get_ws_user
 from app.core.ws_manager import manager
 from app.schemas.chat import ChatMessageEvent, ErrorEvent, TypingEvent, realtime_event_adapter
@@ -17,6 +18,9 @@ from app.services.chat import (
 )
 
 router = APIRouter()
+
+# Rate limiter will be initialized per request to avoid startup issues
+rate_limiter = None
 
 
 def _naive_utc_now() -> datetime:
@@ -32,6 +36,11 @@ async def websocket_endpoint(
     websocket: WebSocket,
     user_id: UUID = Depends(get_ws_user),
 ) -> None:
+    # Initialize rate limiter with current Redis connection
+    global rate_limiter
+    if rate_limiter is None:
+        rate_limiter = WebSocketRateLimiter(manager.redis)
+    
     user_id_str = str(user_id)
     is_first_connection = await manager.connect(websocket, user_id_str)
 
@@ -69,6 +78,14 @@ async def websocket_endpoint(
             )
 
             if isinstance(event, ChatMessageEvent):
+                # Rate limit message sending
+                if not await rate_limiter.can_send_message(user_id_str):
+                    await manager.send_to_socket(
+                        websocket, 
+                        ErrorEvent(detail="Rate limit exceeded. Please wait before sending more messages.").model_dump()
+                    )
+                    continue
+
                 async with SessionLocal() as session:
                     try:
                         stored_message = await persist_chat_message(session, event)
@@ -88,6 +105,10 @@ async def websocket_endpoint(
                 continue
 
             if isinstance(event, TypingEvent):
+                # Rate limit typing indicators
+                if not await rate_limiter.can_send_typing(user_id_str):
+                    continue  # Silently ignore excessive typing events
+
                 async with SessionLocal() as session:
                     try:
                         await validate_typing_event(session, event)

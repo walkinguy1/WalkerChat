@@ -82,27 +82,46 @@ async def revoke_access_token(token: str) -> None:
 
 
 async def create_ws_ticket(user_id: UUID) -> str:
+    from app.core.logging_config import WalkerChatLogger
+    logger = WalkerChatLogger(__name__)
+    
     ticket = uuid4().hex
+    logger.debug(f"Creating WebSocket ticket for user {user_id}: {ticket[:8]}...")
+    
     await set_ephemeral_value(
         f"ws-ticket:{ticket}",
         str(user_id),
         settings.ws_ticket_expiry_seconds,
     )
+    
+    logger.debug(f"WebSocket ticket created and stored: {ticket[:8]}...")
     return ticket
 
 
 async def consume_ws_ticket(ticket: str) -> UUID:
+    from app.core.logging_config import WalkerChatLogger
+    logger = WalkerChatLogger(__name__)
+    
+    logger.debug(f"Attempting to consume WebSocket ticket: {ticket[:8]}...")
+    
     stored_user_id = await get_ephemeral_value(f"ws-ticket:{ticket}")
+    
     if stored_user_id is None:
+        logger.warning(f"WebSocket ticket not found: {ticket[:8]}...")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired WebSocket ticket.",
         )
 
+    logger.debug(f"Found user_id for ticket: {stored_user_id}")
     await delete_ephemeral_value(f"ws-ticket:{ticket}")
+    
     try:
-        return UUID(stored_user_id)
+        user_uuid = UUID(stored_user_id)
+        logger.debug(f"Successfully parsed UUID: {user_uuid}")
+        return user_uuid
     except ValueError as exc:
+        logger.error(f"Failed to parse UUID from stored_user_id: {stored_user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired WebSocket ticket.",
@@ -130,6 +149,8 @@ async def get_ws_user(
     """Validate a one-time WebSocket ticket and return the user id."""
     try:
         return await consume_ws_ticket(ticket)
-    except HTTPException:
+    except HTTPException as exc:
         await websocket.close(code=4001, reason="Invalid or expired token.")
-        raise
+        # Don't re-raise HTTPException in WebSocket context
+        from fastapi import WebSocketException
+        raise WebSocketException(code=4001, reason="Invalid or expired token.") from exc

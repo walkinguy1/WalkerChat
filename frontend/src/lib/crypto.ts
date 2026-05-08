@@ -167,17 +167,29 @@ export const getOrCreateSession = async (
 ): Promise<CryptoSession> => {
   const existing = sessions.get(peerId);
   if (existing) {
+    console.log(`Using existing session for peer ${peerId}`);
     return existing;
   }
 
-  const sharedKey = await deriveSharedKey(
-    myKeys.privateKey,
-    myKeys.publicKeyBase64,
-    peerPublicKeyBase64,
-  );
-  const session = { myKeys, sharedKey };
-  sessions.set(peerId, session);
-  return session;
+  console.log(`Creating new session for peer ${peerId}`);
+  console.log(`My public key: ${myKeys.publicKeyBase64.substring(0, 16)}...`);
+  console.log(`Peer public key: ${peerPublicKeyBase64.substring(0, 16)}...`);
+
+  try {
+    const sharedKey = await deriveSharedKey(
+      myKeys.privateKey,
+      myKeys.publicKeyBase64,
+      peerPublicKeyBase64,
+    );
+    
+    console.log(`Session established successfully for peer ${peerId}`);
+    const session = { myKeys, sharedKey };
+    sessions.set(peerId, session);
+    return session;
+  } catch (error) {
+    console.error(`Failed to establish session with peer ${peerId}:`, error);
+    throw error;
+  }
 };
 
 export const clearAllSessions = () => {
@@ -189,9 +201,11 @@ export const encryptMessage = async (
   aesKey: CryptoKey | null | undefined,
 ): Promise<string> => {
   if (!aesKey) {
+    console.error('Cannot encrypt: No AES key available');
     throw new Error('Secure session is not established yet.');
   }
 
+  console.log(`Encrypting message: "${body}"`);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encrypted = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
@@ -205,33 +219,49 @@ export const encryptMessage = async (
     tag: 'included',
   };
 
-  return JSON.stringify(envelope);
+  const result = JSON.stringify(envelope);
+  console.log(`Encrypted successfully: ${result.substring(0, 50)}...`);
+  return result;
 };
 
 export const decryptMessage = async (
   ciphertext: string,
   aesKey?: CryptoKey | null,
 ): Promise<DemoSignalEnvelope> => {
+  console.log(`Attempting to decrypt: ${ciphertext.substring(0, 50)}...`);
+  console.log(`AES key available: ${!!aesKey}`);
+  
   try {
     const parsed = JSON.parse(ciphertext) as Partial<EncryptedEnvelope>;
+    console.log(`Parsed envelope:`, parsed);
+    
     if (parsed.iv && parsed.ciphertext && aesKey) {
+      console.log('Attempting AES-GCM decryption...');
       const decrypted = await crypto.subtle.decrypt(
         { name: 'AES-GCM', iv: new Uint8Array(fromBase64(parsed.iv)) },
         aesKey,
         fromBase64(parsed.ciphertext),
       );
+      
+      const body = textDecoder.decode(decrypted);
+      console.log(`Decrypted successfully: "${body}"`);
       return {
-        body: textDecoder.decode(decrypted),
+        body,
         createdAt: new Date().toISOString(),
       };
     }
-  } catch {
+  } catch (error) {
+    console.error('AES-GCM decryption failed:', error);
     // Fall through to legacy handling below.
   }
 
+  console.log('Trying legacy envelope decryption...');
   try {
-    return decodeLegacyEnvelope(ciphertext);
-  } catch {
+    const result = decodeLegacyEnvelope(ciphertext);
+    console.log(`Legacy decryption successful: "${result.body}"`);
+    return result;
+  } catch (error) {
+    console.error('Legacy decryption failed:', error);
     return {
       body: aesKey ? '[Unable to decrypt]' : '[Secure session required]',
       createdAt: new Date().toISOString(),

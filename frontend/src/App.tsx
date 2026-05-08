@@ -21,10 +21,9 @@ import {
   resolveDisplayMessage,
 } from './lib/chat';
 import { useWebSocket } from './hooks/useWebSocket';
+import { ChatInterface } from './components/ChatInterface';
 import type {
-  BootstrapChat,
   BootstrapResponse,
-  BootstrapUser,
   ChatMessageEvent,
   DisplayMessage,
   RealtimeEvent,
@@ -72,19 +71,21 @@ const App = () => {
   const [isSigningIn, setIsSigningIn] = useState(false);
   const typingTimeoutRef = useRef<number | null>(null);
 
-  const currentUser = useMemo<BootstrapUser | null>(
-    () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
-    [bootstrap, selectedUserId],
-  );
-  const activeChat = useMemo<BootstrapChat | null>(
-    () => bootstrap?.chats.find((chat) => chat.id === activeChatId) ?? null,
-    [activeChatId, bootstrap],
-  );
-  const peer = useMemo(
-    () =>
-      activeChat?.members.find((member) => member.user_id !== currentUser?.id) ?? null,
-    [activeChat, currentUser?.id],
-  );
+  const currentUser = useMemo(() => {
+    const currentUser = bootstrap?.users.find((user) => user.id === selectedUserId);
+    return currentUser ?? null;
+  }, [bootstrap, selectedUserId]);
+
+  const activeChat = useMemo(() => {
+    const activeChat = bootstrap?.chats.find((chat) => chat.id === activeChatId);
+    return activeChat ?? null;
+  }, [activeChatId, bootstrap]);
+
+  const peer = useMemo(() => {
+    if (!activeChat || !currentUser) return null;
+    const peer = activeChat.members.find((member) => member.user_id !== currentUser.id);
+    return peer ?? null;
+  }, [activeChat, currentUser]);
 
   const socketUrl = wsTicket ? `${wsBaseUrl}/api/ws/chat?ticket=${encodeURIComponent(wsTicket)}` : null;
 
@@ -196,8 +197,40 @@ const App = () => {
 
       try {
         const payload = await fetchHistory(apiUrl, activeChat.id, authToken);
+        
+        // Ensure we have a session key before decrypting messages
+        let activeAesKey = sessionAesKey;
+        if (!activeAesKey && peer && myKeys) {
+          console.log('Establishing session key for history decryption...');
+          try {
+            const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
+            const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
+            if (preferredPeerKey === 'pending-client-upload') {
+              throw new Error('Peer has not uploaded keys yet.');
+            }
+            const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
+            setSessionAesKey(session.sharedKey);
+            activeAesKey = session.sharedKey;
+          } catch (error) {
+            console.error('Failed to establish session for history:', error);
+            // Load messages without decryption
+            const displayMessages = payload.items.map((message) => ({
+              id: message.message_id,
+              clientMessageId: message.message_id,
+              serverMessageId: message.message_id,
+              senderId: message.sender_id,
+              body: '[Encryption key required]',
+              sentAt: message.sent_at,
+              state: 'sent' as const,
+            }));
+            setMessages(displayMessages);
+            setHistoryState('ready');
+            return;
+          }
+        }
+
         const displayMessages = await Promise.all(
-          payload.items.map((message) => resolveDisplayMessage(message, sessionAesKey)),
+          payload.items.map((message) => resolveDisplayMessage(message, activeAesKey)),
         );
         if (!isActive) {
           return;
@@ -219,7 +252,7 @@ const App = () => {
     return () => {
       isActive = false;
     };
-  }, [activeChat, authToken, currentUser, sessionAesKey]);
+  }, [activeChat, authToken, currentUser, sessionAesKey, peer, myKeys]);
 
   useEffect(() => {
     if (!peer || !myKeys || !authToken) {
@@ -396,8 +429,8 @@ const App = () => {
         const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
         setSessionAesKey(session.sharedKey);
         activeAesKey = session.sharedKey;
-      } catch (error) {
-        setErrorNotice('Secure session could not be established. Ensure peer is active.');
+      } catch (err) {
+        setErrorNotice(err instanceof Error ? err.message : 'Secure session could not be established. Ensure peer is active.');
         return;
       }
     }
@@ -441,21 +474,21 @@ const App = () => {
       });
       setErrorNotice(null);
       setDraft('');
-    } catch (error) {
-      console.error('Secure send failed.', error);
-      setErrorNotice(error instanceof Error ? error.message : 'Secure send failed.');
+    } catch (err) {
+      console.error('Secure send failed.', err);
+      setErrorNotice(err instanceof Error ? err.message : 'Secure send failed.');
     }
   };
 
   if (!authToken || bootstrapState === 'signed_out') {
     return (
-      <div className="min-h-screen bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-blue-950 via-slate-950 to-black px-6 py-10 text-slate-100 flex items-center justify-center">
-        <div className="w-full max-w-4xl rounded-3xl border border-white/5 bg-slate-950/40 p-10 shadow-[0_0_80px_-20px_rgba(30,58,138,0.5)] backdrop-blur-xl transition-all">
-          <p className="text-xs uppercase tracking-[0.35em] text-cyan-400/80 font-bold">WalkerChat</p>
-          <h1 className="mt-4 text-5xl font-extrabold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-200 via-cyan-200 to-emerald-200">
+      <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(ellipse_at_15%_0%,_#4a2f16_0%,_#120f0b_45%,_#080705_100%)] px-6 py-10 text-[#ffe6c5]">
+        <div className="w-full max-w-4xl rounded-3xl border border-[#f8cd9855] bg-[#120e0acc] p-10 shadow-[0_25px_90px_-35px_rgba(242,173,91,0.7)] backdrop-blur-xl transition-all">
+          <p className="text-xs font-bold uppercase tracking-[0.35em] text-[#ffbe73]">WalkerChat</p>
+          <h1 className="font-display mt-4 bg-gradient-to-r from-[#ffe6be] via-[#ffcc87] to-[#9fefc9] bg-clip-text text-5xl font-extrabold tracking-tight text-transparent">
             Secure demo sign-in
           </h1>
-          <p className="mt-5 max-w-2xl text-base leading-7 text-slate-400 font-light">
+          <p className="mt-5 max-w-2xl text-base font-light leading-7 text-[#d6b893]">
             This build now avoids placing the main JWT in the WebSocket URL, requires
             a secure session before sending encrypted messages, and exposes explicit
             demo sign-in cards for seeded users.
@@ -475,18 +508,18 @@ const App = () => {
                 type="button"
                 disabled={isSigningIn}
                 onClick={() => void handleSignIn(account.username, account.password)}
-                className="group relative overflow-hidden rounded-[1.5rem] border border-white/10 bg-white/5 p-6 text-left transition-all duration-300 hover:scale-[1.02] hover:border-cyan-400/40 hover:bg-white/10 hover:shadow-[0_0_30px_-5px_rgba(34,211,238,0.3)] disabled:opacity-50"
+                className="group relative overflow-hidden rounded-[1.5rem] border border-[#f3c58844] bg-[#22180f99] p-6 text-left transition-all duration-300 hover:scale-[1.02] hover:border-[#ffc274aa] hover:bg-[#2d2015dd] hover:shadow-[0_0_30px_-5px_rgba(255,196,116,0.35)] disabled:opacity-50"
               >
-                <div className="absolute inset-0 bg-gradient-to-br from-cyan-400/0 via-cyan-400/0 to-cyan-400/5 opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
+                <div className="absolute inset-0 bg-gradient-to-br from-[#6ee5b500] via-[#6ee5b500] to-[#6ee5b522] opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
                 <div className="relative flex items-center gap-5">
-                  <span className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-slate-800 to-slate-900 shadow-inner border border-white/5 text-lg font-bold text-cyan-300 transition-transform duration-300 group-hover:scale-110">
+                  <span className="flex h-16 w-16 items-center justify-center rounded-2xl border border-[#f6d09a33] bg-gradient-to-br from-[#3d2a1b] to-[#1c130d] text-lg font-bold text-[#f8cf91] shadow-inner transition-transform duration-300 group-hover:scale-110">
                     {account.initials}
                   </span>
                   <div>
-                    <span className="block text-xl font-semibold text-white tracking-wide">
+                    <span className="block text-xl font-semibold tracking-wide text-[#fff0d6]">
                       {account.displayName}
                     </span>
-                    <span className="mt-1 block text-xs uppercase tracking-[0.25em] text-cyan-200/50">
+                    <span className="mt-1 block text-xs uppercase tracking-[0.25em] text-[#d6b58a]">
                       @{account.username}
                     </span>
                   </div>
@@ -501,9 +534,9 @@ const App = () => {
 
   if (bootstrapState === 'loading') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-slate-900 to-black text-cyan-200/80">
+      <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(ellipse_at_center,_#3f2a19_0%,_#0f0d0a_75%)] text-[#ffdba8]">
         <div className="flex flex-col items-center gap-4 animate-pulse">
-          <div className="h-10 w-10 border-4 border-cyan-400/30 border-t-cyan-400 rounded-full animate-spin" />
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-[#ffc88140] border-t-[#ffc881]" />
           <span className="text-sm uppercase tracking-widest font-semibold">Loading Workspace...</span>
         </div>
       </div>
@@ -520,25 +553,25 @@ const App = () => {
   }
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-950 via-slate-950 to-black text-slate-100">
+    <div className="min-h-screen bg-[radial-gradient(ellipse_at_top_right,_#48311b_0%,_#14100d_42%,_#090806_100%)] text-[#ffe9cb]">
       <div className="mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-6 sm:px-6 lg:flex-row lg:gap-8 lg:px-8">
 
         {/* SIDEBAR */}
-        <aside className="mb-6 w-full rounded-3xl border border-white/5 bg-slate-900/40 p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)] backdrop-blur-xl lg:mb-0 lg:w-[360px] flex flex-col">
+        <aside className="mb-6 flex w-full flex-col rounded-3xl border border-[#f3c58838] bg-[#16110dda] p-6 shadow-[0_16px_45px_-22px_rgba(0,0,0,0.85)] backdrop-blur-xl lg:mb-0 lg:w-[360px]">
           <div className="mb-8 pl-1">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-[10px] sm:text-xs font-bold uppercase tracking-[0.4em] text-cyan-400/80">
+                <p className="text-[10px] sm:text-xs font-bold uppercase tracking-[0.4em] text-[#ffbd73]">
                   WalkerChat
                 </p>
-                <h1 className="mt-2 text-2xl font-extrabold tracking-tight text-white bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">
+                <h1 className="font-display mt-2 bg-gradient-to-r from-[#ffe9c7] to-[#b4efd4] bg-clip-text text-2xl font-extrabold tracking-tight text-transparent">
                   Encrypted Coordination
                 </h1>
               </div>
               <button
                 type="button"
                 onClick={() => void handleLogout()}
-                className="group flex items-center justify-center rounded-full border border-white/10 bg-white/5 px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-slate-300 transition-all hover:bg-white/10 hover:text-white"
+                className="group flex items-center justify-center rounded-full border border-[#f3c58844] bg-[#291d13b3] px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[#e6c89f] transition-all hover:bg-[#332417] hover:text-[#fff2df]"
               >
                 Logout
               </button>
@@ -547,7 +580,7 @@ const App = () => {
 
           <section className="mb-6 space-y-4">
             <div className="pl-1">
-              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Operate As</p>
+              <p className="text-[10px] font-bold uppercase tracking-widest text-[#aa8b65]">Operate As</p>
             </div>
             <div className="grid gap-3">
               {bootstrap.users.map((user) => (
@@ -563,16 +596,16 @@ const App = () => {
                     }
                   }}
                   className={`group relative overflow-hidden flex items-center gap-4 rounded-2xl border px-4 py-3 text-left transition-all duration-300 ${selectedUserId === user.id
-                    ? 'border-cyan-500/50 bg-gradient-to-r from-cyan-500/20 to-blue-500/10 text-white shadow-[0_0_20px_-5px_rgba(34,211,238,0.2)]'
-                    : 'border-white/5 bg-white/5 text-slate-300 hover:scale-[1.02] hover:bg-white/10'
+                    ? 'border-[#ffd19066] bg-gradient-to-r from-[#4a341f] to-[#1f2820] text-[#fff2de] shadow-[0_0_20px_-7px_rgba(255,186,105,0.35)]'
+                    : 'border-[#f3c5882b] bg-[#241a12b0] text-[#d9be9a] hover:scale-[1.02] hover:bg-[#2b1f15]'
                     }`}
                 >
-                  <span className={`flex h-12 w-12 items-center justify-center rounded-xl text-sm font-bold shadow-inner ${selectedUserId === user.id ? 'bg-cyan-500 text-slate-950' : 'bg-slate-800 text-cyan-300'}`}>
+                  <span className={`flex h-12 w-12 items-center justify-center rounded-xl text-sm font-bold shadow-inner ${selectedUserId === user.id ? 'bg-[#ffc274] text-[#261709]' : 'bg-[#3a291b] text-[#ffd39a]'}`}>
                     {user.initials}
                   </span>
                   <div>
                     <span className="block text-sm font-bold tracking-wide">{user.display_name}</span>
-                    <span className="mt-0.5 block text-[10px] uppercase tracking-widest text-slate-500 group-hover:text-cyan-200/50">
+                    <span className="mt-0.5 block text-[10px] uppercase tracking-widest text-[#ab8e6b] group-hover:text-[#ecc389]">
                       @{user.username}
                     </span>
                   </div>
@@ -581,15 +614,15 @@ const App = () => {
             </div>
           </section>
 
-          <section className="mt-auto rounded-3xl border border-cyan-500/20 bg-gradient-to-br from-cyan-500/10 to-blue-500/5 p-5 backdrop-blur-md">
+          <section className="mt-auto rounded-3xl border border-[#f3c5884a] bg-gradient-to-br from-[#322315] to-[#17201b] p-5 backdrop-blur-md">
             <div className="flex items-center gap-2 mb-4">
-              <div className="h-2 w-2 rounded-full bg-cyan-400 animate-pulse shadow-[0_0_8px_rgba(34,211,238,0.8)]" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-cyan-300">
+              <div className="h-2 w-2 rounded-full bg-[#ffc274] animate-pulse shadow-[0_0_8px_rgba(255,194,116,0.8)]" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-[#ffd49c]">
                 Active Thread
               </p>
             </div>
-            <h2 className="text-xl font-bold tracking-tight text-white mb-2">{activeChat.name}</h2>
-            <p className="text-xs text-slate-300/80 mb-5 leading-relaxed">{activeChat.summary}</p>
+            <h2 className="font-display mb-2 text-xl font-bold tracking-tight text-[#fff0d7]">{activeChat.name}</h2>
+            <p className="mb-5 text-xs leading-relaxed text-[#cfb392]">{activeChat.summary}</p>
 
             <div className="space-y-3">
               {activeChat.members.map((member) => {
@@ -605,17 +638,17 @@ const App = () => {
                     key={member.user_id}
                     type="button"
                     onClick={() => setActiveChatId(activeChat.id)}
-                    className="group relative flex w-full items-center gap-3 rounded-2xl border border-white/5 bg-slate-900/50 px-3 py-3 text-left transition hover:bg-white/10"
+                    className="group relative flex w-full items-center gap-3 rounded-2xl border border-[#f3c5882b] bg-[#1d1611d4] px-3 py-3 text-left transition hover:bg-[#2a1f15]"
                   >
-                    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-800 text-xs font-bold text-cyan-200 shadow-inner group-hover:bg-slate-700 transition-colors">
+                    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#3a291b] text-xs font-bold text-[#ffd49f] shadow-inner transition-colors group-hover:bg-[#4b3522]">
                       {member.initials}
                     </span>
                     <span className="flex-1">
-                      <span className="block text-sm font-bold text-white tracking-wide">
+                      <span className="block text-sm font-bold tracking-wide text-[#fff1dd]">
                         {member.display_name}
                       </span>
                     </span>
-                    <span className="flex items-center gap-2 pr-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">
+                    <span className="flex items-center gap-2 pr-1 text-[10px] font-bold uppercase tracking-widest text-[#a48764]">
                       <span
                         className={`transition-colors h-2 w-2 rounded-full shadow-sm ${presence === 'online' ? 'bg-emerald-400 shadow-emerald-400/50' : 'bg-slate-600'
                           }`}
@@ -630,23 +663,23 @@ const App = () => {
         </aside>
 
         {/* MAIN CHAT AREA */}
-        <main className="flex min-h-[600px] lg:min-h-[720px] flex-1 flex-col rounded-3xl border border-white/10 bg-slate-900/60 shadow-2xl shadow-slate-950/60 backdrop-blur-xl relative overflow-hidden">
-          {/* Subtle background glow */}
-          <div className="absolute top-0 right-0 w-96 h-96 bg-cyan-500/10 rounded-full blur-[100px] pointer-events-none" />
+        <main className="relative flex min-h-[600px] flex-1 flex-col overflow-hidden rounded-3xl border border-[#f3c58840] bg-[#130f0be0] shadow-2xl shadow-black/70 backdrop-blur-xl lg:min-h-[720px]">
+          <div className="pointer-events-none absolute right-0 top-0 h-96 w-96 rounded-full bg-[#ffc2741f] blur-[110px]" />
+          <div className="pointer-events-none absolute bottom-[-120px] left-[-120px] h-80 w-80 rounded-full bg-[#67d8ad1c] blur-[100px]" />
 
-          <header className="relative flex flex-col gap-4 border-b border-white/10 bg-white/5 px-6 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+          <header className="relative flex flex-col gap-4 border-b border-[#f3c58838] bg-[#2a1f1496] px-6 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
             <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.25em] text-cyan-400">
+              <p className="text-[10px] font-bold uppercase tracking-[0.25em] text-[#ffc274]">
                 Secure Channel
               </p>
-              <h2 className="mt-1 text-3xl font-extrabold tracking-tight text-white">{activeChat.name}</h2>
-              <p className="mt-1 text-xs text-slate-400">
-                Signed in as <span className="text-white font-semibold">{currentUser.display_name}</span>
+              <h2 className="font-display mt-1 text-3xl font-extrabold tracking-tight text-[#fff2de]">{activeChat.name}</h2>
+              <p className="mt-1 text-xs text-[#bfa27f]">
+                Signed in as <span className="font-semibold text-[#fff1dd]">{currentUser.display_name}</span>
                 {peer ? `, chatting with ${peer.display_name}` : ''}
               </p>
             </div>
 
-            <div className="flex items-center gap-3 rounded-full border border-white/10 bg-slate-950/50 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-slate-300 backdrop-blur-sm">
+            <div className="flex items-center gap-3 rounded-full border border-[#f3c58844] bg-[#170f09bd] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e1c5a0] backdrop-blur-sm">
               <span
                 className={`h-2 w-2 rounded-full transition-colors ${connectionState === 'open' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]'
                   }`}
@@ -655,7 +688,7 @@ const App = () => {
             </div>
           </header>
 
-          <section className="relative flex-1 overflow-y-auto px-6 py-8 sm:px-8 flex flex-col scroll-smooth">
+          <section className="relative flex flex-1 flex-col overflow-y-auto px-6 py-8 scroll-smooth sm:px-8">
             {errorNotice ? (
               <div className="mb-6 rounded-2xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200 backdrop-blur flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
                 <div className="h-2 w-2 rounded-full bg-red-400 animate-pulse" />
@@ -663,71 +696,33 @@ const App = () => {
               </div>
             ) : null}
 
-            {historyState === 'error' ? (
-              <div className="mb-6 rounded-2xl border border-rose-400/30 bg-rose-400/10 p-4 text-sm text-rose-100 backdrop-blur">
-                Encrypted history could not be loaded from the backend yet.
+            {historyState === 'loading' ? (
+              <div className="mb-5 inline-flex w-fit items-center gap-2 rounded-full border border-[#f3c58845] bg-[#2a1f1590] px-4 py-1.5 text-xs uppercase tracking-[0.2em] text-[#f3cf9d]">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-[#ffc274]" />
+                Syncing encrypted history
               </div>
             ) : null}
 
-            <div className="space-y-6 mt-auto">
-              {messages.map((message) => {
-                const isCurrentUser = message.senderId === currentUser.id;
+            {historyState === 'ready' && messages.length === 0 ? (
+              <div className="mb-5 rounded-2xl border border-[#f3c58830] bg-[#1b140fad] p-4 text-sm text-[#d6b792]">
+                No encrypted messages yet. Start the thread with a secure envelope.
+              </div>
+            ) : null}
 
-                return (
-                  <div
-                    key={message.id}
-                    className={`flex ${isCurrentUser ? 'justify-end' : 'justify-start'} animate-in slide-in-from-bottom-2 fade-in duration-300`}
-                  >
-                    <article
-                      className={`max-w-[85%] sm:max-w-xl px-5 py-4 shadow-md transition-all ${isCurrentUser
-                        ? 'rounded-3xl rounded-tr-sm bg-gradient-to-br from-cyan-400 to-blue-500 text-slate-950 shadow-cyan-500/20 hover:shadow-cyan-500/40'
-                        : 'rounded-3xl rounded-tl-sm border border-white/10 bg-slate-800/80 text-white backdrop-blur-md hover:bg-slate-800'
-                        }`}
-                    >
-                      <p className={`text-[15px] leading-relaxed ${isCurrentUser ? 'font-medium' : 'font-light'}`}>{message.body}</p>
-                      <div
-                        className={`mt-2 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest ${isCurrentUser ? 'text-slate-900/60' : 'text-slate-400'
-                          }`}
-                      >
-                        <span>{new Date(message.sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                        {isCurrentUser && (
-                          <span className="flex items-center gap-1">
-                            <span className="h-1 w-1 rounded-full bg-current opacity-50" />
-                            {message.state}
-                          </span>
-                        )}
-                      </div>
-                    </article>
-                  </div>
-                );
-              })}
-
-              {typingUserId === peer?.user_id ? (
-                <div className="flex justify-start animate-in fade-in slide-in-from-bottom-2 duration-300">
-                  <div className="flex items-center gap-2 rounded-full border border-white/10 bg-slate-800/60 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-slate-400 backdrop-blur-sm">
-                    <div className="flex gap-1 mr-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-                    </div>
-                    {peer.display_name} is typing
-                  </div>
-                </div>
-              ) : null}
-
-              {historyState === 'loading' ? (
-                <div className="flex items-center justify-center py-4">
-                  <div className="text-xs font-bold uppercase tracking-widest text-slate-500 animate-pulse">Loading encrypted history...</div>
-                </div>
-              ) : null}
-            </div>
+            <ChatInterface
+              messages={messages}
+              currentUser={currentUser}
+              peer={peer}
+              isTyping={typingUserId === peer?.user_id}
+              connectionLabel={connectionLabel}
+            />
           </section>
 
-          <footer className="relative border-t border-white/10 bg-slate-900/80 px-6 py-5 sm:px-8 backdrop-blur-xl">
-            <div className="rounded-[1.75rem] border border-white/10 bg-slate-950/50 p-3 shadow-inner">
+          <footer className="relative border-t border-[#f3c5883a] bg-[#1a130dc4] px-6 py-5 backdrop-blur-xl sm:px-8">
+            <div className="rounded-[1.75rem] border border-[#f3c5884a] bg-[#0f0b08cc] p-3 shadow-inner">
               <div className="mb-3 flex items-center justify-between gap-3 px-2 text-[10px] font-bold uppercase tracking-widest">
-                <span className="text-cyan-400">{currentUser.display_name}</span>
-                <span className={`flex items-center gap-2 ${sessionAesKey ? 'text-emerald-400' : 'text-slate-500'}`}>
+                <span className="text-[#ffc274]">{currentUser.display_name}</span>
+                <span className={`flex items-center gap-2 ${sessionAesKey ? 'text-emerald-400' : 'text-[#7a6449]'}`}>
                   {sessionAesKey && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse border border-emerald-300 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />}
                   {sessionAesKey ? 'AES-GCM session active' : 'Waiting for session key'}
                 </span>
@@ -745,13 +740,13 @@ const App = () => {
                   }}
                   rows={2}
                   placeholder="Compose an encrypted message envelope..."
-                  className="min-h-[5rem] flex-1 resize-none rounded-[1.25rem] border border-white/10 bg-slate-900/50 px-5 py-4 text-[15px] font-light text-white outline-none transition-all placeholder:text-slate-500 focus:border-cyan-500/50 focus:bg-slate-900/80 focus:shadow-[0_0_15px_-3px_rgba(34,211,238,0.15)]"
+                  className="min-h-[5rem] flex-1 resize-none rounded-[1.25rem] border border-[#f3c58840] bg-[#1b140fbf] px-5 py-4 text-[15px] font-light text-[#ffe9ca] outline-none transition-all placeholder:text-[#8f775a] focus:border-[#ffc274aa] focus:bg-[#22190fd9] focus:shadow-[0_0_20px_-7px_rgba(255,194,116,0.6)]"
                 />
                 <button
                   type="button"
                   onClick={() => void handleSend()}
                   disabled={!draft.trim() || !sessionAesKey}
-                  className="group relative overflow-hidden rounded-[1.25rem] bg-gradient-to-r from-cyan-400 to-emerald-400 px-6 py-4 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition-all hover:scale-105 hover:shadow-cyan-500/40 active:scale-95 disabled:hover:scale-100 disabled:opacity-50 disabled:shadow-none"
+                  className="group relative flex-shrink-0 overflow-hidden rounded-[1.25rem] bg-gradient-to-r from-[#ffc274] to-[#74d7b0] px-4 py-2 text-xs font-bold text-[#231509] shadow-lg shadow-[#ffc2743d] transition-all hover:scale-105 hover:shadow-[#ffc27475] active:scale-95 disabled:hover:scale-100 disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
                 >
                   <div className="absolute inset-0 bg-white/20 opacity-0 transition-opacity group-hover:opacity-100" />
                   <span className="relative flex items-center gap-2">

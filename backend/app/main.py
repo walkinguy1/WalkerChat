@@ -4,11 +4,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.core.logging_config import setup_logging
+from app.core.exceptions import setup_exception_handlers
+
 from app.api.auth import router as auth_router
 from app.api.bootstrap import router as bootstrap_router
 from app.api.chats import router as chat_router
+from app.api.health import router as health_router
 from app.api.keys import router as keys_router
+from app.api.test import router as test_router
 from app.api.ws import router as ws_router
+from app.api.webrtc import router as webrtc_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_database
 from app.core.runtime_state import close_runtime_redis
@@ -16,6 +22,9 @@ from app.core.ws_manager import manager
 from app.services.chat import seed_demo_data
 
 settings = get_settings()
+
+# Initialize logging
+setup_logging()
 
 
 @asynccontextmanager
@@ -35,6 +44,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+# Register exception handlers
+setup_exception_handlers(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -46,8 +58,11 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(bootstrap_router)
 app.include_router(chat_router)
+app.include_router(health_router)
 app.include_router(keys_router)
+app.include_router(test_router)
 app.include_router(ws_router, prefix="/api/ws", tags=["websocket"])
+app.include_router(webrtc_router, prefix="/api/webrtc", tags=["webrtc"])
 
 
 @app.get("/")
