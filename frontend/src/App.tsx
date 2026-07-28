@@ -18,12 +18,17 @@ import {
   type KeyBundle,
 } from './lib/crypto';
 import {
+  buildReactionTallies,
+  buildReplyRef,
   createOptimisticDisplayMessage,
   encodeMessagePayload,
+  encodeReactionPayload,
   mergeMessages,
-  resolveDisplayMessage,
+  mergeReactions,
+  resolveEnvelope,
 } from './lib/chat';
 import { encryptAndUploadImage } from './lib/media';
+import { clearSearchIndex, indexChatMessages } from './lib/search';
 import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useWebRTC, type OutboundSignal } from './hooks/useWebRTC';
@@ -33,6 +38,7 @@ import { ChatHeader } from './components/ChatHeader';
 import { MessageList, type HistoryState } from './components/MessageList';
 import { Composer } from './components/Composer';
 import { CallOverlay } from './components/CallOverlay';
+import { CommandPalette } from './components/CommandPalette';
 import { Lightbox, type LightboxImage } from './components/Lightbox';
 import { Toaster } from './components/ui/Toaster';
 import { Logo } from './components/ui/Logo';
@@ -43,7 +49,9 @@ import type {
   ChatMessageRecord,
   DisplayMessage,
   ImageAttachment,
+  ReactionEvent,
   RealtimeEvent,
+  ReplyRef,
   WebRtcSignalEvent,
 } from './types/chat';
 
@@ -75,6 +83,9 @@ const App = () => {
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
+  /** Reaction log for the open thread; folded into tallies below. */
+  const [reactions, setReactions] = useState<ReactionEvent[]>([]);
+  const [replyTo, setReplyTo] = useState<DisplayMessage | null>(null);
   /** Raw ciphertext records; decrypted by a separate effect once a key exists. */
   const [historyRecords, setHistoryRecords] = useState<ChatMessageRecord[]>([]);
   const [historyState, setHistoryState] = useState<HistoryState>('idle');
@@ -96,9 +107,9 @@ const App = () => {
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
 
   const typingTimeoutRef = useRef<number | null>(null);
-  const searchInputRef = useRef<HTMLInputElement>(null);
   // Set after useWebRTC initialises, so the socket handler below can reach it
   // without the two hooks depending on each other.
   const handleSignalRef = useRef<((signal: WebRtcSignalEvent) => void) | null>(null);
@@ -117,6 +128,9 @@ const App = () => {
     if (!activeChat || !currentUser) return null;
     return activeChat.members.find((member) => member.user_id !== currentUser.id) ?? null;
   }, [activeChat, currentUser]);
+
+  /** Replaying the reaction log in send order makes arrival order irrelevant. */
+  const reactionsByMessageId = useMemo(() => buildReactionTallies(reactions), [reactions]);
 
   const socketUrl = wsTicket
     ? `${wsBaseUrl}/api/ws/chat?ticket=${encodeURIComponent(wsTicket)}`
@@ -137,8 +151,16 @@ const App = () => {
 
       if (message.type === 'chat_message') {
         if (message.chat_id === activeChat.id) {
-          void resolveDisplayMessage(message, sessionAesKey).then((displayMessage) => {
-            setMessages((previousMessages) => mergeMessages(previousMessages, displayMessage));
+          void resolveEnvelope(message, sessionAesKey).then((resolved) => {
+            if (resolved.kind === 'reaction') {
+              setReactions((previousReactions) =>
+                mergeReactions(previousReactions, resolved.reaction),
+              );
+              return;
+            }
+            setMessages((previousMessages) =>
+              mergeMessages(previousMessages, resolved.message),
+            );
           });
         }
         return;
@@ -280,6 +302,8 @@ const App = () => {
   if (activeChatId !== loadedChatId) {
     setLoadedChatId(activeChatId);
     setMessages([]);
+    setReactions([]);
+    setReplyTo(null);
     setHistoryRecords([]);
     setTypingUserId(null);
     setHistoryState(activeChatId ? 'loading' : 'idle');
@@ -329,18 +353,44 @@ const App = () => {
     let isActive = true;
 
     void Promise.all(
-      historyRecords.map((record) => resolveDisplayMessage(record, sessionAesKey)),
-    ).then((decrypted) => {
+      historyRecords.map((record) => resolveEnvelope(record, sessionAesKey)),
+    ).then((resolved) => {
       if (!isActive) return;
+
       // Fold through mergeMessages so live messages that arrived while we were
       // decrypting are preserved rather than overwritten.
-      setMessages((previousMessages) => decrypted.reduce(mergeMessages, previousMessages));
+      setMessages((previousMessages) =>
+        resolved
+          .filter((entry) => entry.kind === 'message')
+          .map((entry) => entry.message)
+          .reduce(mergeMessages, previousMessages),
+      );
+
+      setReactions((previousReactions) =>
+        resolved
+          .filter((entry) => entry.kind === 'reaction')
+          .map((entry) => entry.reaction)
+          .reduce(mergeReactions, previousReactions),
+      );
     });
 
     return () => {
       isActive = false;
     };
   }, [historyRecords, sessionAesKey]);
+
+  /**
+   * Feed decrypted plaintext into the local search index.
+   *
+   * The server only ever holds ciphertext, so this is the only place a search
+   * over message text can happen at all.
+   */
+  useEffect(() => {
+    if (!activeChatId || !messages.length) {
+      return;
+    }
+    indexChatMessages(activeChatId, messages);
+  }, [activeChatId, messages]);
 
   /** Establish the shared AES key for the open thread. */
   useEffect(() => {
@@ -415,7 +465,7 @@ const App = () => {
     };
   }, [activeChat, currentUser, draft, peer, sendMessage]);
 
-  /** `/` focuses search, Escape closes whatever overlay is open. */
+  /** ⌘K / Ctrl+K (or `/`) opens search, Escape closes what is open. */
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -424,10 +474,15 @@ const App = () => {
         target?.tagName === 'TEXTAREA' ||
         target?.isContentEditable;
 
+      if (event.key.toLowerCase() === 'k' && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        setIsSearchOpen((isOpen) => !isOpen);
+        return;
+      }
+
       if (event.key === '/' && !isEditing) {
         event.preventDefault();
-        setIsSidebarOpen(true);
-        searchInputRef.current?.focus();
+        setIsSearchOpen(true);
         return;
       }
 
@@ -489,6 +544,8 @@ const App = () => {
     } finally {
       clearAllSessions();
       clearToasts();
+      // Decrypted plaintext must not outlive the session it belongs to.
+      clearSearchIndex();
       setAuthToken(null);
       setWsTicket(null);
       setMyKeys(null);
@@ -498,11 +555,14 @@ const App = () => {
       setBootstrap(null);
       setBootstrapState('signed_out');
       setMessages([]);
+      setReactions([]);
+      setReplyTo(null);
       setHistoryRecords([]);
       setHistoryState('idle');
       setDraft('');
       setTypingUserId(null);
       setIsSidebarOpen(false);
+      setIsSearchOpen(false);
     }
   };
 
@@ -546,12 +606,16 @@ const App = () => {
     aesKey: CryptoKey,
     caption: string,
     attachment?: ImageAttachment,
+    replyRef?: ReplyRef,
   ): Promise<boolean> => {
     if (!activeChat || !currentUser || !peer) {
       return false;
     }
 
-    const ciphertext = await encryptMessage(encodeMessagePayload(caption, attachment), aesKey);
+    const ciphertext = await encryptMessage(
+      encodeMessagePayload(caption, attachment, replyRef),
+      aesKey,
+    );
 
     const outboundMessage: ChatMessageEvent = {
       type: 'chat_message',
@@ -572,7 +636,7 @@ const App = () => {
     setMessages((previousMessages) =>
       mergeMessages(
         previousMessages,
-        createOptimisticDisplayMessage(caption, outboundMessage, attachment),
+        createOptimisticDisplayMessage(caption, outboundMessage, attachment, replyRef),
       ),
     );
 
@@ -604,12 +668,84 @@ const App = () => {
     }
 
     try {
-      if (await sendEncryptedMessage(activeAesKey, trimmedDraft)) {
+      const replyRef = replyTo ? buildReplyRef(replyTo) : undefined;
+      if (await sendEncryptedMessage(activeAesKey, trimmedDraft, undefined, replyRef)) {
         setDraft('');
+        setReplyTo(null);
       }
     } catch (error) {
       console.error('Secure send failed.', error);
       pushToast(error instanceof Error ? error.message : 'Secure send failed.');
+    }
+  };
+
+  /**
+   * Add or remove one reaction.
+   *
+   * It goes out as an ordinary encrypted message, so the server records that
+   * something was sent but never learns which message was reacted to, nor with
+   * what. The cost is one stored row per reaction and per undo.
+   */
+  const handleToggleReaction = async (message: DisplayMessage, emoji: string) => {
+    if (!activeChat || !currentUser || !peer) {
+      return;
+    }
+
+    const alreadyMine = (reactionsByMessageId.get(message.id) ?? []).some(
+      (tally) => tally.emoji === emoji && tally.userIds.includes(currentUser.id),
+    );
+    const action = alreadyMine ? 'remove' : 'add';
+
+    const activeAesKey = await ensureSessionKey();
+    if (!activeAesKey) {
+      return;
+    }
+
+    try {
+      const ciphertext = await encryptMessage(
+        encodeReactionPayload(message.id, emoji, action),
+        activeAesKey,
+      );
+
+      const clientMessageId = crypto.randomUUID();
+      const sentAt = new Date().toISOString();
+
+      const sent = sendMessage({
+        type: 'chat_message',
+        chat_id: activeChat.id,
+        client_message_id: clientMessageId,
+        sender_id: currentUser.id,
+        target_id: peer.user_id,
+        ciphertext,
+        is_media: false,
+        encryption: {
+          algorithm: 'aes-256-gcm',
+          version: 1,
+          key_id: `${currentUser.username}-primary-device`,
+        },
+        sent_at: sentAt,
+      } satisfies ChatMessageEvent);
+
+      if (!sent) {
+        pushToast('The socket is not connected yet. Reconnect and react again.');
+        return;
+      }
+
+      // Render immediately; the echo carries the same client id, and
+      // mergeReactions keeps the pair from double-counting.
+      setReactions((previousReactions) =>
+        mergeReactions(previousReactions, {
+          id: clientMessageId,
+          targetMessageId: message.id,
+          senderId: currentUser.id,
+          emoji,
+          action,
+          sentAt,
+        }),
+      );
+    } catch (error) {
+      console.error('Reaction send failed.', error);
+      pushToast(error instanceof Error ? error.message : 'Unable to send that reaction.');
     }
   };
 
@@ -749,6 +885,10 @@ const App = () => {
     ? (presenceByUserId[peer.user_id] ?? peer.presence_state)
     : 'offline';
 
+  const onlineMemberCount = activeChat.members.filter(
+    (member) => (presenceByUserId[member.user_id] ?? member.presence_state) === 'online',
+  ).length;
+
   return (
     <div className="flex h-full overflow-hidden">
       {/* Scrim for the mobile slide-over. */}
@@ -768,8 +908,10 @@ const App = () => {
         )}
       >
         <Sidebar
-          ref={searchInputRef}
           currentUser={currentUser}
+          currentUserRole={
+            demoAccounts.find((account) => account.username === currentUser.username)?.role
+          }
           conversations={conversations}
           activeChatId={activeChatId}
           isSocketOpen={isSocketOpen}
@@ -777,6 +919,7 @@ const App = () => {
             setActiveChatId(chatId);
             setIsSidebarOpen(false);
           }}
+          onOpenSearch={() => setIsSearchOpen(true)}
           onSignOut={() => void handleSignOut()}
           onClose={() => setIsSidebarOpen(false)}
         />
@@ -791,6 +934,7 @@ const App = () => {
           isSecure={Boolean(sessionAesKey)}
           isPeerTyping={typingUserId === peer?.user_id}
           canCall={Boolean(peer) && !call.isCallActive && isSocketOpen}
+          onlineCount={onlineMemberCount}
           onStartCall={(media) => void handleStartCall(media)}
           onOpenSidebar={() => setIsSidebarOpen(true)}
         />
@@ -801,10 +945,13 @@ const App = () => {
           peer={peer}
           isPeerTyping={typingUserId === peer?.user_id}
           historyState={historyState}
+          reactionsByMessageId={reactionsByMessageId}
           apiUrl={apiUrl}
           authToken={authToken}
           sessionAesKey={sessionAesKey}
           onOpenImage={(url, name) => setLightboxImage({ url, name })}
+          onReply={setReplyTo}
+          onToggleReaction={(message, emoji) => void handleToggleReaction(message, emoji)}
         />
 
         <Composer
@@ -816,6 +963,13 @@ const App = () => {
           isUploading={isUploadingPhoto}
           isSocketOpen={isSocketOpen}
           peerName={peer?.display_name ?? activeChat.name}
+          replyTo={replyTo}
+          replyAuthorName={
+            replyTo?.senderId === currentUser.id
+              ? currentUser.display_name
+              : (peer?.display_name ?? 'this thread')
+          }
+          onCancelReply={() => setReplyTo(null)}
         />
       </main>
 
@@ -834,6 +988,18 @@ const App = () => {
         onHangUp={call.hangUp}
         onToggleMute={call.toggleMute}
         onToggleCamera={call.toggleCamera}
+      />
+
+      <CommandPalette
+        isOpen={isSearchOpen}
+        chats={bootstrap.chats}
+        users={bootstrap.users}
+        currentUser={currentUser}
+        onClose={() => setIsSearchOpen(false)}
+        onSelectChat={(chatId) => {
+          setActiveChatId(chatId);
+          setIsSidebarOpen(false);
+        }}
       />
 
       <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />

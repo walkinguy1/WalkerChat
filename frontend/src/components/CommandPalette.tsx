@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import clsx from 'clsx';
 import { Hash, ImageIcon, Lock, Search, Users } from 'lucide-react';
 import { Avatar } from './ui/Avatar';
@@ -21,6 +21,13 @@ const SCOPES: { id: Scope; label: string }[] = [
   { id: 'photos', label: 'Photos' },
 ];
 
+const SECTION_LABELS: Record<Result['kind'], string> = {
+  message: 'Messages',
+  photo: 'Photos',
+  person: 'People',
+  room: 'Rooms',
+};
+
 interface CommandPaletteProps {
   isOpen: boolean;
   chats: BootstrapChat[];
@@ -31,21 +38,21 @@ interface CommandPaletteProps {
 }
 
 type Result =
-  | { kind: 'message'; key: string; entry: SearchEntry; matchStart: number; matchEnd: number }
-  | { kind: 'photo'; key: string; entry: SearchEntry }
-  | { kind: 'person'; key: string; user: BootstrapUser; chatId: string | null }
-  | { kind: 'room'; key: string; chat: BootstrapChat };
+  | {
+      kind: 'message';
+      chatId: string;
+      entry: SearchEntry;
+      matchStart: number;
+      matchEnd: number;
+    }
+  | { kind: 'photo'; chatId: string; entry: SearchEntry }
+  | { kind: 'person'; chatId: string | null; user: BootstrapUser }
+  | { kind: 'room'; chatId: string; chat: BootstrapChat };
 
-const Highlighted = ({
-  body,
-  start,
-  end,
-}: {
-  body: string;
-  start: number;
-  end: number;
-}) => (
+/** Show the match in context rather than the head of a long message. */
+const Highlighted = ({ body, start, end }: { body: string; start: number; end: number }) => (
   <>
+    {start > 48 ? '…' : null}
     {body.slice(Math.max(0, start - 48), start)}
     <mark className="rounded-[2px] bg-accent-soft px-0.5 text-ink">{body.slice(start, end)}</mark>
     {body.slice(end, end + 96)}
@@ -63,96 +70,26 @@ export const CommandPalette = ({
   const [query, setQuery] = useState('');
   const [scope, setScope] = useState<Scope>('all');
   const [activeIndex, setActiveIndex] = useState(0);
+  const [wasOpen, setWasOpen] = useState(isOpen);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Each open starts clean rather than resuming somebody's last search.
-  useEffect(() => {
-    if (!isOpen) return;
-    setQuery('');
-    setScope('all');
-    setActiveIndex(0);
-    inputRef.current?.focus();
-  }, [isOpen]);
-
-  const chatNameById = useMemo(
-    () => new Map(chats.map((chat) => [chat.id, chat])),
-    [chats],
-  );
-
-  const userNameById = useMemo(
-    () => new Map(users.map((user) => [user.id, user])),
-    [users],
-  );
-
-  const { messages, photos, people, rooms } = useMemo(() => {
-    if (!isOpen) {
-      return { messages: [], photos: [], people: [], rooms: [] };
+  // Each open starts clean rather than resuming somebody's last search. Reset
+  // during render so a stale query never paints for a frame.
+  if (isOpen !== wasOpen) {
+    setWasOpen(isOpen);
+    if (isOpen) {
+      setQuery('');
+      setScope('all');
+      setActiveIndex(0);
     }
+  }
 
-    const needle = query.trim().toLowerCase();
-
-    const matchedMessages =
-      scope === 'all' || scope === 'messages' ? searchLocalIndex(query, 8) : [];
-
-    const matchedPhotos =
-      scope === 'photos' || (scope === 'all' && needle) ? searchLocalPhotos(query, 6) : [];
-
-    const matchedPeople =
-      scope === 'all' || scope === 'people'
-        ? users.filter(
-            (user) =>
-              !needle ||
-              user.display_name.toLowerCase().includes(needle) ||
-              user.username.toLowerCase().includes(needle),
-          )
-        : [];
-
-    const matchedRooms =
-      scope === 'all' || scope === 'rooms'
-        ? chats.filter((chat) => !needle || chat.name.toLowerCase().includes(needle))
-        : [];
-
-    return {
-      messages: matchedMessages,
-      photos: matchedPhotos,
-      people: matchedPeople,
-      rooms: matchedRooms,
-    };
-  }, [chats, isOpen, query, scope, users]);
-
-  /** Which thread to open when a person is picked. */
-  const chatIdForUser = (userId: string) =>
-    chats.find((chat) => chat.members.some((member) => member.user_id === userId))?.id ?? null;
-
-  const results = useMemo<Result[]>(
-    () => [
-      ...messages.map<Result>((hit) => ({
-        kind: 'message',
-        key: `message-${hit.messageId}`,
-        entry: hit,
-        matchStart: hit.matchStart,
-        matchEnd: hit.matchEnd,
-      })),
-      ...photos.map<Result>((entry) => ({
-        kind: 'photo',
-        key: `photo-${entry.messageId}`,
-        entry,
-      })),
-      ...people.map<Result>((user) => ({
-        kind: 'person',
-        key: `person-${user.id}`,
-        user,
-        chatId: chatIdForUser(user.id),
-      })),
-      ...rooms.map<Result>((chat) => ({ kind: 'room', key: `room-${chat.id}`, chat })),
-    ],
-    // chatIdForUser only reads `chats`, which is already a dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [chats, messages, people, photos, rooms],
-  );
-
-  useEffect(() => setActiveIndex(0), [query, scope]);
+  useEffect(() => {
+    if (isOpen) {
+      inputRef.current?.focus();
+    }
+  }, [isOpen]);
 
   // Keep the highlighted row in view as the arrows walk past the fold.
   useEffect(() => {
@@ -161,23 +98,76 @@ export const CommandPalette = ({
       ?.scrollIntoView({ block: 'nearest' });
   }, [activeIndex]);
 
+  const chatById = useMemo(() => new Map(chats.map((chat) => [chat.id, chat])), [chats]);
+  const userById = useMemo(() => new Map(users.map((user) => [user.id, user])), [users]);
+
+  const results = useMemo<Result[]>(() => {
+    if (!isOpen) return [];
+
+    const needle = query.trim().toLowerCase();
+
+    /** The thread to open when a person is picked. */
+    const chatIdForUser = (userId: string) =>
+      chats.find((chat) => chat.members.some((member) => member.user_id === userId))?.id ?? null;
+
+    const messages: Result[] =
+      scope === 'all' || scope === 'messages'
+        ? searchLocalIndex(query, 8).map((hit) => ({
+            kind: 'message',
+            chatId: hit.chatId,
+            entry: hit,
+            matchStart: hit.matchStart,
+            matchEnd: hit.matchEnd,
+          }))
+        : [];
+
+    const photos: Result[] =
+      scope === 'photos' || (scope === 'all' && needle)
+        ? searchLocalPhotos(query, 6).map((entry) => ({
+            kind: 'photo',
+            chatId: entry.chatId,
+            entry,
+          }))
+        : [];
+
+    const people: Result[] =
+      scope === 'all' || scope === 'people'
+        ? users
+            .filter(
+              (user) =>
+                !needle ||
+                user.display_name.toLowerCase().includes(needle) ||
+                user.username.toLowerCase().includes(needle),
+            )
+            .map((user) => ({ kind: 'person', chatId: chatIdForUser(user.id), user }))
+        : [];
+
+    const rooms: Result[] =
+      scope === 'all' || scope === 'rooms'
+        ? chats
+            .filter((chat) => !needle || chat.name.toLowerCase().includes(needle))
+            .map((chat) => ({ kind: 'room', chatId: chat.id, chat }))
+        : [];
+
+    return [...messages, ...photos, ...people, ...rooms];
+  }, [chats, isOpen, query, scope, users]);
+
+  const sectionCounts = useMemo(() => {
+    const counts = new Map<Result['kind'], number>();
+    results.forEach((result) => counts.set(result.kind, (counts.get(result.kind) ?? 0) + 1));
+    return counts;
+  }, [results]);
+
   if (!isOpen) return null;
 
   const openResult = (result: Result) => {
-    const chatId =
-      result.kind === 'room'
-        ? result.chat.id
-        : result.kind === 'person'
-          ? result.chatId
-          : result.entry.chatId;
-
-    if (chatId) {
-      onSelectChat(chatId);
+    if (result.chatId) {
+      onSelectChat(result.chatId);
     }
     onClose();
   };
 
-  const handleKeyDown = (event: React.KeyboardEvent) => {
+  const handleKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Escape') {
       event.preventDefault();
       onClose();
@@ -199,24 +189,134 @@ export const CommandPalette = ({
     }
   };
 
-  let rowIndex = -1;
-  const nextRowIndex = () => {
-    rowIndex += 1;
-    return rowIndex;
-  };
-
   const rowClasses = (index: number) =>
     clsx(
       'flex w-full gap-3 rounded-field p-2.5 text-left transition-colors',
       index === activeIndex ? 'bg-raised' : 'hover:bg-raised/70',
     );
 
-  const sectionHeading = (label: string, count?: number) => (
-    <p className="px-2.5 pt-2.5 pb-1.5 text-[11px] font-medium tracking-wide text-ink-subtle uppercase">
-      {label}
-      {count === undefined ? null : <span className="ml-1.5 text-ink-subtle/70">{count}</span>}
-    </p>
-  );
+  const renderRow = (result: Result, index: number) => {
+    const shared = {
+      'data-active': index === activeIndex,
+      onMouseEnter: () => setActiveIndex(index),
+      onClick: () => openResult(result),
+    };
+
+    if (result.kind === 'message') {
+      const { entry } = result;
+      const chat = chatById.get(entry.chatId);
+      const sender = userById.get(entry.senderId);
+      const senderName =
+        entry.senderId === currentUser.id ? 'You' : (sender?.display_name ?? 'Unknown');
+
+      return (
+        <button key={`message-${entry.messageId}`} type="button" {...shared} className={rowClasses(index)}>
+          <Avatar name={senderName} initials={sender?.initials} size="sm" className="h-8 w-8" />
+          <span className="min-w-0 flex-1">
+            <span className="flex items-baseline gap-2">
+              <span className="text-[13px] font-semibold">{senderName}</span>
+              {chat ? (
+                <span className="flex items-center gap-1 text-[11px] text-ink-subtle">
+                  {chat.kind === 'room' ? (
+                    <Hash className="h-[11px] w-[11px]" aria-hidden="true" />
+                  ) : null}
+                  {chat.name}
+                </span>
+              ) : null}
+              <span className="ml-auto flex-shrink-0 text-[11px] text-ink-subtle tabular-nums">
+                {formatRelativeShort(entry.sentAt)}
+              </span>
+            </span>
+            <span className="mt-0.5 block truncate text-[13px] leading-[1.5] text-ink-muted">
+              <Highlighted body={entry.body} start={result.matchStart} end={result.matchEnd} />
+            </span>
+          </span>
+        </button>
+      );
+    }
+
+    if (result.kind === 'photo') {
+      const { entry } = result;
+      const chat = chatById.get(entry.chatId);
+
+      return (
+        <button
+          key={`photo-${entry.messageId}`}
+          type="button"
+          {...shared}
+          className={clsx(rowClasses(index), 'items-center')}
+        >
+          <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-raised text-ink-subtle">
+            <ImageIcon className="h-[15px] w-[15px]" aria-hidden="true" />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] font-semibold">
+              {entry.body || 'Encrypted photo'}
+            </span>
+            <span className="mt-0.5 block text-[12px] text-ink-subtle">
+              {chat?.name ?? 'Unknown thread'} · {formatRelativeShort(entry.sentAt)}
+            </span>
+          </span>
+        </button>
+      );
+    }
+
+    if (result.kind === 'person') {
+      const { user } = result;
+
+      return (
+        <button
+          key={`person-${user.id}`}
+          type="button"
+          {...shared}
+          className={clsx(rowClasses(index), 'items-center')}
+        >
+          <Avatar
+            name={user.display_name}
+            initials={user.initials}
+            size="sm"
+            className="h-8 w-8"
+            presence={user.presence_state}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] font-semibold">
+              {user.display_name}
+              {user.id === currentUser.id ? (
+                <span className="ml-1.5 font-normal text-ink-subtle">you</span>
+              ) : null}
+            </span>
+            <span className="mt-0.5 block text-[12px] text-ink-subtle">@{user.username}</span>
+          </span>
+        </button>
+      );
+    }
+
+    const { chat } = result;
+
+    return (
+      <button
+        key={`room-${chat.id}`}
+        type="button"
+        {...shared}
+        className={clsx(rowClasses(index), 'items-center')}
+      >
+        <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-raised text-ink-subtle">
+          {chat.kind === 'room' ? (
+            <Hash className="h-[15px] w-[15px]" aria-hidden="true" />
+          ) : (
+            <Users className="h-[15px] w-[15px]" aria-hidden="true" />
+          )}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[13px] font-semibold">{chat.name}</span>
+          <span className="mt-0.5 block truncate text-[12px] text-ink-subtle">
+            {chat.member_count} member{chat.member_count === 1 ? '' : 's'} · {chat.summary}
+          </span>
+        </span>
+        <span className="flex-shrink-0 self-center font-mono text-[11px] text-ink-subtle">↵</span>
+      </button>
+    );
+  };
 
   return (
     <div
@@ -238,7 +338,10 @@ export const CommandPalette = ({
           <input
             ref={inputRef}
             value={query}
-            onChange={(event) => setQuery(event.target.value)}
+            onChange={(event) => {
+              setQuery(event.target.value);
+              setActiveIndex(0);
+            }}
             placeholder="Search messages, people and rooms"
             aria-label="Search"
             className="min-w-0 flex-1 bg-transparent text-[15px] placeholder:text-ink-subtle focus:outline-none"
@@ -253,7 +356,10 @@ export const CommandPalette = ({
             <button
               key={entry.id}
               type="button"
-              onClick={() => setScope(entry.id)}
+              onClick={() => {
+                setScope(entry.id);
+                setActiveIndex(0);
+              }}
               className={clsx(
                 'flex h-[26px] items-center rounded-full px-2.5 text-[12px] transition-colors',
                 scope === entry.id
@@ -282,147 +388,19 @@ export const CommandPalette = ({
             </p>
           ) : null}
 
-          {messages.length ? sectionHeading('Messages', messages.length) : null}
-          {messages.map((hit) => {
-            const index = nextRowIndex();
-            const chat = chatNameById.get(hit.chatId);
-            const sender = userNameById.get(hit.senderId);
-            const senderName =
-              hit.senderId === currentUser.id ? 'You' : (sender?.display_name ?? 'Unknown');
-
-            return (
-              <button
-                key={`message-${hit.messageId}`}
-                type="button"
-                data-active={index === activeIndex}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => openResult({ kind: 'message', key: '', entry: hit, matchStart: hit.matchStart, matchEnd: hit.matchEnd })}
-                className={rowClasses(index)}
-              >
-                <Avatar
-                  name={senderName}
-                  initials={sender?.initials}
-                  size="sm"
-                  className="h-8 w-8"
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-baseline gap-2">
-                    <span className="text-[13px] font-semibold">{senderName}</span>
-                    {chat ? (
-                      <span className="flex items-center gap-1 text-[11px] text-ink-subtle">
-                        {chat.kind === 'room' ? (
-                          <Hash className="h-[11px] w-[11px]" aria-hidden="true" />
-                        ) : null}
-                        {chat.name}
-                      </span>
-                    ) : null}
-                    <span className="ml-auto flex-shrink-0 text-[11px] text-ink-subtle tabular-nums">
-                      {formatRelativeShort(hit.sentAt)}
-                    </span>
+          {results.map((result, index) => (
+            <div key={`${result.kind}-${index}`}>
+              {results[index - 1]?.kind === result.kind ? null : (
+                <p className="px-2.5 pt-2.5 pb-1.5 text-[11px] font-medium tracking-wide text-ink-subtle uppercase">
+                  {SECTION_LABELS[result.kind]}
+                  <span className="ml-1.5 text-ink-subtle/70">
+                    {sectionCounts.get(result.kind)}
                   </span>
-                  <span className="mt-0.5 block truncate text-[13px] leading-[1.5] text-ink-muted">
-                    <Highlighted body={hit.body} start={hit.matchStart} end={hit.matchEnd} />
-                  </span>
-                </span>
-              </button>
-            );
-          })}
-
-          {photos.length ? sectionHeading('Photos', photos.length) : null}
-          {photos.map((entry) => {
-            const index = nextRowIndex();
-            const chat = chatNameById.get(entry.chatId);
-
-            return (
-              <button
-                key={`photo-${entry.messageId}`}
-                type="button"
-                data-active={index === activeIndex}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => openResult({ kind: 'photo', key: '', entry })}
-                className={clsx(rowClasses(index), 'items-center')}
-              >
-                <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-raised text-ink-subtle">
-                  <ImageIcon className="h-[15px] w-[15px]" aria-hidden="true" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-semibold">
-                    {entry.body || 'Encrypted photo'}
-                  </span>
-                  <span className="mt-0.5 block text-[12px] text-ink-subtle">
-                    {chat?.name ?? 'Unknown thread'} · {formatRelativeShort(entry.sentAt)}
-                  </span>
-                </span>
-              </button>
-            );
-          })}
-
-          {people.length ? sectionHeading('People', people.length) : null}
-          {people.map((user) => {
-            const index = nextRowIndex();
-            const chatId = chatIdForUser(user.id);
-
-            return (
-              <button
-                key={`person-${user.id}`}
-                type="button"
-                data-active={index === activeIndex}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => openResult({ kind: 'person', key: '', user, chatId })}
-                className={clsx(rowClasses(index), 'items-center')}
-              >
-                <Avatar
-                  name={user.display_name}
-                  initials={user.initials}
-                  size="sm"
-                  className="h-8 w-8"
-                  presence={user.presence_state}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-semibold">
-                    {user.display_name}
-                    {user.id === currentUser.id ? (
-                      <span className="ml-1.5 font-normal text-ink-subtle">you</span>
-                    ) : null}
-                  </span>
-                  <span className="mt-0.5 block text-[12px] text-ink-subtle">@{user.username}</span>
-                </span>
-              </button>
-            );
-          })}
-
-          {rooms.length ? sectionHeading('Rooms', rooms.length) : null}
-          {rooms.map((chat) => {
-            const index = nextRowIndex();
-
-            return (
-              <button
-                key={`room-${chat.id}`}
-                type="button"
-                data-active={index === activeIndex}
-                onMouseEnter={() => setActiveIndex(index)}
-                onClick={() => openResult({ kind: 'room', key: '', chat })}
-                className={clsx(rowClasses(index), 'items-center')}
-              >
-                <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-raised text-ink-subtle">
-                  {chat.kind === 'room' ? (
-                    <Hash className="h-[15px] w-[15px]" aria-hidden="true" />
-                  ) : (
-                    <Users className="h-[15px] w-[15px]" aria-hidden="true" />
-                  )}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-semibold">{chat.name}</span>
-                  <span className="mt-0.5 block truncate text-[12px] text-ink-subtle">
-                    {chat.member_count} member{chat.member_count === 1 ? '' : 's'} · {chat.summary}
-                  </span>
-                </span>
-                <span className="flex-shrink-0 self-center font-mono text-[11px] text-ink-subtle">
-                  ↵
-                </span>
-              </button>
-            );
-          })}
+                </p>
+              )}
+              {renderRow(result, index)}
+            </div>
+          ))}
         </div>
 
         <div className="flex flex-shrink-0 items-center gap-3.5 border-t border-line bg-sunken px-[18px] py-2.5 text-[11px] text-ink-subtle">
@@ -434,6 +412,8 @@ export const CommandPalette = ({
             <span className="rounded border border-line bg-raised px-1.5 py-px font-mono">↵</span>
             open
           </span>
+          {/* The backend holds ciphertext, so there is no server-side search to
+              send a query to. Saying so beats leaving the user to assume. */}
           <span className="ml-auto flex items-center gap-1.5">
             <Lock className="h-[11px] w-[11px] text-signal" aria-hidden="true" />
             Searched locally · 0 queries sent

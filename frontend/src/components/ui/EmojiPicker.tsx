@@ -98,5 +98,3 @@ export const EmojiPicker = ({
     </div>
   );
 };
-
-export const QUICK_EMOJI = EMOJI.slice(0, 5);
