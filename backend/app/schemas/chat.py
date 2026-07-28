@@ -23,17 +23,34 @@ class ChatMessageEvent(BaseModel):
     sender_id: UUID
     target_id: UUID
     ciphertext: str = Field(min_length=1)
+    is_media: bool = False
     encryption: EncryptionMetadata = Field(default_factory=EncryptionMetadata)
     sent_at: datetime | None = None
 
 
 class WebRTCSignalEvent(BaseModel):
+    """Call signaling relayed over the chat socket.
+
+    The server never inspects `payload` beyond forwarding it; SDP and ICE
+    candidates are opaque here. `chat_id` exists so membership can be verified
+    before a signal reaches anybody.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["webrtc_offer", "webrtc_answer", "webrtc_ice"]
+    type: Literal[
+        "webrtc_offer",
+        "webrtc_answer",
+        "webrtc_ice",
+        "webrtc_hangup",
+        "webrtc_reject",
+    ]
+    chat_id: UUID
+    call_id: UUID
     sender_id: UUID
     target_id: UUID
-    payload: dict[str, Any]
+    media: Literal["audio", "video"] = "video"
+    payload: dict[str, Any] = Field(default_factory=dict)
     sent_at: datetime | None = None
 
 

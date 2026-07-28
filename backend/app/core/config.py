@@ -32,6 +32,27 @@ class Settings(BaseSettings):
     auth_rate_limit_attempts: int = 10
     auth_rate_limit_window_seconds: int = 60
 
+    # Encrypted media storage (MinIO / S3-compatible)
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "minioadmin"
+    minio_secret_key: str = "minioadmin"
+    minio_secure: bool = False
+    media_bucket: str = "walkerchat-media"
+    media_max_bytes: int = 8 * 1024 * 1024
+    media_rate_limit_uploads: int = 20
+    media_rate_limit_window_seconds: int = 60
+
+    # WebRTC
+    webrtc_stun_urls: list[str] = Field(
+        default_factory=lambda: [
+            "stun:stun.l.google.com:19302",
+            "stun:stun1.l.google.com:19302",
+        ]
+    )
+    webrtc_turn_url: str = ""
+    webrtc_turn_username: str = ""
+    webrtc_turn_credential: str = ""
+
     demo_chat_id: UUID = UUID("11111111-1111-1111-1111-111111111111")
     demo_alice_id: UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
     demo_bob_id: UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")

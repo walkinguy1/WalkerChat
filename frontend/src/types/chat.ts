@@ -12,8 +12,36 @@ export type ChatMessageEvent = {
   sender_id: string;
   target_id: string;
   ciphertext: string;
+  is_media?: boolean;
   encryption: EncryptionMetadata;
   sent_at?: string;
+};
+
+/**
+ * Describes an encrypted image. This object is itself encrypted inside the
+ * message envelope, so the server learns neither the mime type nor the IV
+ * needed to read the blob it stores.
+ */
+export type ImageAttachment = {
+  kind: 'image';
+  media_id: string;
+  iv: string;
+  mime: string;
+  name: string;
+  size: number;
+  width?: number;
+  height?: number;
+};
+
+/**
+ * Decrypted message body. Plain text messages are stored as a bare string for
+ * backward compatibility; anything with an attachment uses this envelope,
+ * tagged with `_wc` so a user typing raw JSON is not mistaken for one.
+ */
+export type StructuredMessagePayload = {
+  _wc: 1;
+  caption: string;
+  attachment: ImageAttachment;
 };
 
 export type ChatMessageRecord = {
@@ -45,10 +73,22 @@ export type PresenceEvent = {
   sent_at?: string;
 };
 
+export type CallMediaKind = 'audio' | 'video';
+
+export type WebRtcSignalType =
+  | 'webrtc_offer'
+  | 'webrtc_answer'
+  | 'webrtc_ice'
+  | 'webrtc_hangup'
+  | 'webrtc_reject';
+
 export type WebRtcSignalEvent = {
-  type: 'webrtc_offer' | 'webrtc_answer' | 'webrtc_ice';
+  type: WebRtcSignalType;
+  chat_id: string;
+  call_id: string;
   sender_id: string;
   target_id: string;
+  media: CallMediaKind;
   payload: Record<string, unknown>;
   sent_at?: string;
 };
@@ -75,6 +115,7 @@ export type DisplayMessage = {
   serverMessageId?: string;
   senderId: string;
   body: string;
+  attachment?: ImageAttachment;
   sentAt: string;
   state: 'sending' | 'sent';
 };

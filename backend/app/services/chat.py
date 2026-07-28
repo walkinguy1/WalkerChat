@@ -17,6 +17,7 @@ from app.schemas.chat import (
     DemoUserProfile,
     PresenceEvent,
     TypingEvent,
+    WebRTCSignalEvent,
 )
 
 settings = get_settings()
@@ -138,6 +139,7 @@ async def persist_chat_message(
         chat_id=event.chat_id,
         sender_id=event.sender_id,
         encrypted_payload=event.ciphertext,
+        is_media=event.is_media,
         sent_at=_to_naive_utc(event.sent_at or _naive_utc_now()),
     )
     session.add(message)
@@ -186,6 +188,20 @@ async def get_recent_messages(
 
 
 async def validate_typing_event(session: AsyncSession, event: TypingEvent) -> None:
+    await ensure_chat_delivery_allowed(
+        session,
+        chat_id=event.chat_id,
+        sender_id=event.sender_id,
+        target_id=event.target_id,
+    )
+
+
+async def validate_webrtc_event(session: AsyncSession, event: WebRTCSignalEvent) -> None:
+    """Stop call signals from reaching users who do not share the chat.
+
+    Without this, any authenticated socket could push an offer at any user id
+    and force their client to ring.
+    """
     await ensure_chat_delivery_allowed(
         session,
         chat_id=event.chat_id,

@@ -12,12 +12,14 @@ from app.api.bootstrap import router as bootstrap_router
 from app.api.chats import router as chat_router
 from app.api.health import router as health_router
 from app.api.keys import router as keys_router
+from app.api.media import router as media_router
 from app.api.test import router as test_router
 from app.api.ws import router as ws_router
 from app.api.webrtc import router as webrtc_router
 from app.core.config import get_settings
 from app.core.database import SessionLocal, init_database
 from app.core.runtime_state import close_runtime_redis
+from app.core.storage import ensure_media_bucket
 from app.core.ws_manager import manager
 from app.services.chat import seed_demo_data
 
@@ -33,6 +35,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     async with SessionLocal() as session:
         await seed_demo_data(session)
+
+    # Non-fatal: chat still works without object storage, only photos break.
+    await ensure_media_bucket()
 
     await manager.startup()
     try:
@@ -60,6 +65,7 @@ app.include_router(bootstrap_router)
 app.include_router(chat_router)
 app.include_router(health_router)
 app.include_router(keys_router)
+app.include_router(media_router)
 app.include_router(test_router)
 app.include_router(ws_router, prefix="/api/ws", tags=["websocket"])
 app.include_router(webrtc_router, prefix="/api/webrtc", tags=["webrtc"])

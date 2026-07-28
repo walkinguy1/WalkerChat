@@ -51,8 +51,12 @@ class InMemoryRateLimiter:
         self.window_size = settings.auth_rate_limit_window_seconds
         self.max_requests = settings.auth_rate_limit_attempts
     
-    def is_allowed(self, key: str) -> bool:
-        """Check if the key is allowed to make a request."""
+    async def is_allowed(self, key: str) -> bool:
+        """Check if the key is allowed to make a request.
+
+        Async to match RedisRateLimiter — WebSocketRateLimiter awaits whichever
+        backend it selected.
+        """
         current_time = time.time()
         window_start = current_time - self.window_size
         

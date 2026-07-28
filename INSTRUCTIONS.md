@@ -114,16 +114,28 @@ Current WebSocket event types:
 - `webrtc_offer`
 - `webrtc_answer`
 - `webrtc_ice`
+- `webrtc_hangup`
+- `webrtc_reject`
 - `presence` (server-published)
 - `error` (server to client)
+
+All of them are validated by the discriminated union in
+`backend/app/schemas/chat.py`, which sets `extra="forbid"` — an unexpected field
+rejects the whole event.
 
 ### Chat message requirements
 
 - Must include `chat_id`
+- Must include `client_message_id`
 - Must include `sender_id`
 - Must include `target_id`
 - Must include `ciphertext`
 - Must include encryption metadata
+- May include `is_media` (defaults to `false`); set it when the encrypted
+  payload carries a photo attachment
+
+Delivered to both the target and the sender, so the sender can reconcile its
+optimistic bubble against the server-assigned `message_id`.
 
 ### Typing event requirements
 
@@ -131,6 +143,17 @@ Current WebSocket event types:
 - Must include `sender_id`
 - Must include `target_id`
 - Must include `is_typing`
+
+### WebRTC signal requirements
+
+- Must include `chat_id` — membership is verified before the signal is relayed
+- Must include `call_id` so late signals from an ended call are ignored
+- Must include `sender_id` and `target_id`
+- May include `media` (`"audio"` or `"video"`, defaults to `"video"`)
+- `payload` carries the SDP or ICE candidate and is never inspected by the
+  server
+
+Delivered to the target only — the caller does not get an echo.
 
 ## 8. Message Flow
 
@@ -199,14 +222,36 @@ Migration direction:
 5. Keep only ciphertext and public key material on the server.
 6. Do not move plaintext handling into backend services.
 
-## 11. How To Add Calling
+## 11. Calling
 
-For calls:
+Calling is implemented. Media is peer-to-peer via native `RTCPeerConnection`;
+the backend only relays signaling.
 
-1. Keep media peer-to-peer with WebRTC.
-2. Use WebSockets only for signaling.
-3. Add new signaling payload schemas if needed.
-4. Keep ICE, offer, and answer messages typed and validated.
+- `frontend/src/hooks/useWebRTC.ts` owns the call state machine
+- `frontend/src/components/CallPanel.tsx` is the call UI
+- Signals ride the existing chat socket at `/api/ws/chat`
+- `GET /api/webrtc/ice-config` returns the STUN/TURN list
+
+Do not open a second WebSocket for signaling. WS tickets are single-use and
+consumed on connect, so a second socket cannot authenticate, and registering it
+in the shared `ConnectionManager` corrupts presence tracking.
+
+STUN alone suffices on a LAN or localhost. Peers behind symmetric NAT need a
+TURN relay — set `WEBRTC_TURN_URL`, `WEBRTC_TURN_USERNAME`, and
+`WEBRTC_TURN_CREDENTIAL`.
+
+## 11b. Encrypted Photos
+
+Photos are end-to-end encrypted with the same AES-GCM session key as text.
+
+1. `frontend/src/lib/media.ts` downscales the image (which also strips EXIF),
+   encrypts it, and uploads the ciphertext to `POST /api/media/{chat_id}/upload`
+2. The returned `media_id`, plus the IV and mime type, go into an attachment
+   descriptor that is itself encrypted inside the chat message envelope
+3. `GET /api/media/{media_id}` returns the ciphertext; the browser decrypts it
+
+The server stores bytes it cannot read, and the IV never sits next to the blob.
+Both endpoints verify chat membership. Requires MinIO to be running.
 
 ## 12. Verification Checklist
 

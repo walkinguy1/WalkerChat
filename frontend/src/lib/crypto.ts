@@ -224,6 +224,44 @@ export const encryptMessage = async (
   return result;
 };
 
+/**
+ * Encrypt raw bytes (an image) with the chat session key.
+ *
+ * The IV is returned separately rather than prefixed onto the blob, because it
+ * travels inside the encrypted chat message envelope while the ciphertext goes
+ * to object storage.
+ */
+export const encryptBytes = async (
+  data: ArrayBuffer,
+  aesKey: CryptoKey | null | undefined,
+): Promise<{ ciphertext: ArrayBuffer; ivBase64: string }> => {
+  if (!aesKey) {
+    throw new Error('Secure session is not established yet.');
+  }
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, data);
+
+  return { ciphertext, ivBase64: toBase64(iv.buffer) };
+};
+
+/** Reverse of encryptBytes. Throws when the key or IV does not match. */
+export const decryptBytes = async (
+  ciphertext: ArrayBuffer,
+  ivBase64: string,
+  aesKey: CryptoKey | null | undefined,
+): Promise<ArrayBuffer> => {
+  if (!aesKey) {
+    throw new Error('Secure session is not established yet.');
+  }
+
+  return crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(fromBase64(ivBase64)) },
+    aesKey,
+    ciphertext,
+  );
+};
+
 export const decryptMessage = async (
   ciphertext: string,
   aesKey?: CryptoKey | null,

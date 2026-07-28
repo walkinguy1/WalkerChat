@@ -9,12 +9,19 @@ from app.core.database import SessionLocal
 from app.core.rate_limiter import WebSocketRateLimiter
 from app.core.security import get_ws_user
 from app.core.ws_manager import manager
-from app.schemas.chat import ChatMessageEvent, ErrorEvent, TypingEvent, realtime_event_adapter
+from app.schemas.chat import (
+    ChatMessageEvent,
+    ErrorEvent,
+    TypingEvent,
+    WebRTCSignalEvent,
+    realtime_event_adapter,
+)
 from app.services.chat import (
     build_presence_events,
     persist_chat_message,
     set_presence_state,
     validate_typing_event,
+    validate_webrtc_event,
 )
 
 router = APIRouter()
@@ -112,6 +119,21 @@ async def websocket_endpoint(
                 async with SessionLocal() as session:
                     try:
                         await validate_typing_event(session, event)
+                    except PermissionError as exc:
+                        await manager.send_to_socket(
+                            websocket, ErrorEvent(detail=str(exc)).model_dump()
+                        )
+                        continue
+
+                await manager.publish(event.model_dump(mode="json"))
+                continue
+
+            if isinstance(event, WebRTCSignalEvent):
+                # Call signaling rides this socket; media itself stays
+                # peer-to-peer and never reaches the server.
+                async with SessionLocal() as session:
+                    try:
+                        await validate_webrtc_event(session, event)
                     except PermissionError as exc:
                         await manager.send_to_socket(
                             websocket, ErrorEvent(detail=str(exc)).model_dump()

@@ -115,6 +115,84 @@ export const fetchPrekeyBundle = async (
   return (await response.json()) as PrekeyBundle;
 };
 
+export type MediaUploadResponse = {
+  media_id: string;
+  chat_id: string;
+  size_bytes: number;
+  created_at: string;
+};
+
+/** POST already-encrypted image bytes. The server never sees the plaintext. */
+export const uploadEncryptedMedia = async (
+  apiUrl: string,
+  chatId: string,
+  token: string,
+  ciphertext: ArrayBuffer,
+): Promise<MediaUploadResponse> => {
+  const form = new FormData();
+  form.append('file', new Blob([ciphertext], { type: 'application/octet-stream' }), 'blob.bin');
+
+  const response = await fetch(`${apiUrl}/api/media/${chatId}/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Media upload failed with status ${response.status}`),
+    );
+  }
+
+  return (await response.json()) as MediaUploadResponse;
+};
+
+/** Fetch encrypted image bytes back. Decryption happens in the caller. */
+export const fetchEncryptedMedia = async (
+  apiUrl: string,
+  mediaId: string,
+  token: string,
+): Promise<ArrayBuffer> => {
+  const response = await fetch(`${apiUrl}/api/media/${mediaId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Media download failed with status ${response.status}`),
+    );
+  }
+
+  return response.arrayBuffer();
+};
+
+export type IceConfigResponse = {
+  ice_servers: { urls: string[]; username?: string | null; credential?: string | null }[];
+};
+
+export const fetchIceConfig = async (
+  apiUrl: string,
+  token: string,
+): Promise<RTCIceServer[]> => {
+  const response = await fetch(`${apiUrl}/api/webrtc/ice-config`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `ICE config failed with status ${response.status}`),
+    );
+  }
+
+  const payload = (await response.json()) as IceConfigResponse;
+
+  return payload.ice_servers.map((server) => ({
+    urls: server.urls,
+    ...(server.username ? { username: server.username } : {}),
+    ...(server.credential ? { credential: server.credential } : {}),
+  }));
+};
+
 export const uploadIdentityKeys = async (
   apiUrl: string,
   token: string,

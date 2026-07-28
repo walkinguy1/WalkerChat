@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchBootstrap,
   fetchHistory,
+  fetchIceConfig,
   fetchPrekeyBundle,
   fetchWsTicket,
   login,
@@ -17,17 +18,28 @@ import {
 } from './lib/crypto';
 import {
   createOptimisticDisplayMessage,
+  encodeMessagePayload,
   mergeMessages,
   resolveDisplayMessage,
 } from './lib/chat';
+import { ACCEPTED_IMAGE_TYPES, encryptAndUploadImage } from './lib/media';
 import { useWebSocket } from './hooks/useWebSocket';
+import { useWebRTC, type OutboundSignal } from './hooks/useWebRTC';
 import { ChatInterface } from './components/ChatInterface';
+import { CallPanel } from './components/CallPanel';
 import type {
   BootstrapResponse,
+  CallMediaKind,
   ChatMessageEvent,
   DisplayMessage,
+  ImageAttachment,
   RealtimeEvent,
+  WebRtcSignalEvent,
 } from './types/chat';
+
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  { urls: ['stun:stun.l.google.com:19302'] },
+];
 
 const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 const wsBaseUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
@@ -69,7 +81,14 @@ const App = () => {
   const [myKeys, setMyKeys] = useState<KeyBundle | null>(null);
   const [sessionAesKey, setSessionAesKey] = useState<CryptoKey | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
   const typingTimeoutRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Set after useWebRTC initialises, so the socket handler below can reach it
+  // without the two hooks depending on each other.
+  const handleSignalRef = useRef<((signal: WebRtcSignalEvent) => void) | null>(null);
 
   const currentUser = useMemo(() => {
     const currentUser = bootstrap?.users.find((user) => user.id === selectedUserId);
@@ -91,6 +110,13 @@ const App = () => {
 
   const { connectionState, sendMessage } = useWebSocket<RealtimeEvent>(socketUrl, {
     onMessage: (message) => {
+      // Call signals are handled before the chat guards so an incoming call
+      // still rings while chat state is settling.
+      if (message.type.startsWith('webrtc_')) {
+        handleSignalRef.current?.(message as WebRtcSignalEvent);
+        return;
+      }
+
       if (!activeChat || !currentUser) {
         return;
       }
@@ -132,6 +158,63 @@ const App = () => {
       }
     },
   });
+
+  const sendCallSignal = useCallback(
+    (signal: OutboundSignal) => {
+      if (!activeChat || !currentUser || !peer) {
+        return false;
+      }
+
+      return sendMessage({
+        type: signal.type,
+        chat_id: activeChat.id,
+        call_id: signal.call_id,
+        sender_id: currentUser.id,
+        target_id: peer.user_id,
+        media: signal.media,
+        payload: signal.payload,
+      } satisfies WebRtcSignalEvent);
+    },
+    // sendMessage is re-created each render but only reads a socket ref, so it
+    // is safe to leave out of the dependency list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeChat, currentUser, peer],
+  );
+
+  const call = useWebRTC({
+    sendSignal: sendCallSignal,
+    iceServers,
+    onError: (message) => setErrorNotice(message),
+  });
+
+  useEffect(() => {
+    handleSignalRef.current = (signal) => {
+      void call.handleSignal(signal);
+    };
+  }, [call]);
+
+  useEffect(() => {
+    if (!authToken) {
+      return;
+    }
+
+    let isActive = true;
+
+    fetchIceConfig(apiUrl, authToken)
+      .then((servers) => {
+        if (isActive && servers.length) {
+          setIceServers(servers);
+        }
+      })
+      .catch((error) => {
+        // Falling back to public STUN still works on most home networks.
+        console.warn('Unable to load ICE configuration, using defaults.', error);
+      });
+
+    return () => {
+      isActive = false;
+    };
+  }, [authToken]);
 
   useEffect(() => {
     if (!authToken) {
@@ -403,6 +486,97 @@ const App = () => {
     }
   };
 
+  /**
+   * Return the chat's AES key, establishing the session on demand.
+   *
+   * Both text and photo sends need this, and either can run before the
+   * background key exchange effect has finished.
+   */
+  const ensureSessionKey = async (): Promise<CryptoKey | null> => {
+    if (sessionAesKey) {
+      return sessionAesKey;
+    }
+
+    if (!peer || !myKeys || !authToken) {
+      setErrorNotice('Secure session is not ready yet. Wait for key exchange to finish.');
+      return null;
+    }
+
+    try {
+      const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
+      const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
+      if (preferredPeerKey === 'pending-client-upload') {
+        throw new Error('Peer has not uploaded keys yet.');
+      }
+      const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
+      setSessionAesKey(session.sharedKey);
+      return session.sharedKey;
+    } catch (err) {
+      setErrorNotice(
+        err instanceof Error
+          ? err.message
+          : 'Secure session could not be established. Ensure peer is active.',
+      );
+      return null;
+    }
+  };
+
+  /** Encrypt, send, and optimistically render one message. */
+  const sendEncryptedMessage = async (
+    aesKey: CryptoKey,
+    caption: string,
+    attachment?: ImageAttachment,
+  ): Promise<boolean> => {
+    if (!activeChat || !currentUser || !peer) {
+      return false;
+    }
+
+    const ciphertext = await encryptMessage(
+      encodeMessagePayload(caption, attachment),
+      aesKey,
+    );
+
+    const outboundMessage: ChatMessageEvent = {
+      type: 'chat_message',
+      chat_id: activeChat.id,
+      client_message_id: crypto.randomUUID(),
+      sender_id: currentUser.id,
+      target_id: peer.user_id,
+      ciphertext,
+      is_media: Boolean(attachment),
+      encryption: {
+        algorithm: 'aes-256-gcm',
+        version: 1,
+        key_id: `${currentUser.username}-primary-device`,
+      },
+      sent_at: new Date().toISOString(),
+    };
+
+    setMessages((previousMessages) =>
+      mergeMessages(
+        previousMessages,
+        createOptimisticDisplayMessage(caption, outboundMessage, attachment),
+      ),
+    );
+
+    const wasSent = sendMessage(outboundMessage);
+    if (!wasSent) {
+      setErrorNotice('The socket is not ready yet. Reconnect and send again.');
+      return false;
+    }
+
+    sendMessage({
+      type: 'typing',
+      chat_id: activeChat.id,
+      sender_id: currentUser.id,
+      target_id: peer.user_id,
+      is_typing: false,
+    });
+
+    setErrorNotice(null);
+    return true;
+  };
+
   const handleSend = async () => {
     if (!activeChat || !currentUser || !peer) {
       return;
@@ -413,71 +587,72 @@ const App = () => {
       return;
     }
 
-    let activeAesKey = sessionAesKey;
-
+    const activeAesKey = await ensureSessionKey();
     if (!activeAesKey) {
-      if (!peer || !myKeys || !authToken) {
-        setErrorNotice('Secure session is not ready yet. Wait for key exchange to finish.');
-        return;
-      }
-      try {
-        const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
-        const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
-        if (preferredPeerKey === 'pending-client-upload') {
-          throw new Error('Peer has not uploaded keys yet.');
-        }
-        const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
-        setSessionAesKey(session.sharedKey);
-        activeAesKey = session.sharedKey;
-      } catch (err) {
-        setErrorNotice(err instanceof Error ? err.message : 'Secure session could not be established. Ensure peer is active.');
-        return;
-      }
+      return;
     }
 
     try {
-      const ciphertext = await encryptMessage(trimmedDraft, activeAesKey);
-      const outboundMessage: ChatMessageEvent = {
-        type: 'chat_message',
-        chat_id: activeChat.id,
-        client_message_id: crypto.randomUUID(),
-        sender_id: currentUser.id,
-        target_id: peer.user_id,
-        ciphertext,
-        encryption: {
-          algorithm: 'aes-256-gcm',
-          version: 1,
-          key_id: `${currentUser.username}-primary-device`,
-        },
-        sent_at: new Date().toISOString(),
-      };
-
-      setMessages((previousMessages) =>
-        mergeMessages(
-          previousMessages,
-          createOptimisticDisplayMessage(trimmedDraft, outboundMessage),
-        ),
-      );
-
-      const wasSent = sendMessage(outboundMessage);
-      if (!wasSent) {
-        setErrorNotice('The socket is not ready yet. Reconnect and send again.');
-        return;
+      if (await sendEncryptedMessage(activeAesKey, trimmedDraft)) {
+        setDraft('');
       }
-
-      sendMessage({
-        type: 'typing',
-        chat_id: activeChat.id,
-        sender_id: currentUser.id,
-        target_id: peer.user_id,
-        is_typing: false,
-      });
-      setErrorNotice(null);
-      setDraft('');
     } catch (err) {
       console.error('Secure send failed.', err);
       setErrorNotice(err instanceof Error ? err.message : 'Secure send failed.');
     }
+  };
+
+  /**
+   * Encrypt a photo in the browser, upload the ciphertext, then send a message
+   * carrying the (also encrypted) attachment descriptor. The backend stores
+   * bytes it cannot read.
+   */
+  const handlePhotoSelected = async (file: File) => {
+    if (!activeChat || !currentUser || !peer || !authToken) {
+      return;
+    }
+
+    const activeAesKey = await ensureSessionKey();
+    if (!activeAesKey) {
+      return;
+    }
+
+    setIsUploadingPhoto(true);
+    setErrorNotice(null);
+
+    try {
+      const attachment = await encryptAndUploadImage(
+        apiUrl,
+        activeChat.id,
+        authToken,
+        activeAesKey,
+        file,
+      );
+
+      if (await sendEncryptedMessage(activeAesKey, draft.trim(), attachment)) {
+        setDraft('');
+      }
+    } catch (err) {
+      console.error('Encrypted photo send failed.', err);
+      setErrorNotice(err instanceof Error ? err.message : 'Unable to send that photo.');
+    } finally {
+      setIsUploadingPhoto(false);
+    }
+  };
+
+  const handleStartCall = async (media: CallMediaKind) => {
+    if (!peer) {
+      setErrorNotice('Select a chat with a peer before starting a call.');
+      return;
+    }
+
+    if (connectionState !== 'open') {
+      setErrorNotice('The secure socket is not connected, so a call cannot be placed.');
+      return;
+    }
+
+    setErrorNotice(null);
+    await call.startCall(media);
   };
 
   if (!authToken || bootstrapState === 'signed_out') {
@@ -679,12 +854,33 @@ const App = () => {
               </p>
             </div>
 
-            <div className="flex items-center gap-3 rounded-full border border-[#f3c58844] bg-[#170f09bd] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e1c5a0] backdrop-blur-sm">
-              <span
-                className={`h-2 w-2 rounded-full transition-colors ${connectionState === 'open' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]'
-                  }`}
-              />
-              <span>{connectionLabel}</span>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => void handleStartCall('audio')}
+                disabled={!peer || call.isCallActive || connectionState !== 'open'}
+                title="Start a voice call"
+                className="rounded-full border border-[#f3c58844] bg-[#291d13b3] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e6c89f] transition-all hover:scale-105 hover:bg-[#332417] hover:text-[#fff2df] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
+              >
+                Voice
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleStartCall('video')}
+                disabled={!peer || call.isCallActive || connectionState !== 'open'}
+                title="Start a video call"
+                className="rounded-full bg-gradient-to-r from-[#ffc274] to-[#74d7b0] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#231509] shadow-lg shadow-[#ffc2743d] transition-all hover:scale-105 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
+              >
+                Video
+              </button>
+
+              <div className="flex items-center gap-3 rounded-full border border-[#f3c58844] bg-[#170f09bd] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e1c5a0] backdrop-blur-sm">
+                <span
+                  className={`h-2 w-2 rounded-full transition-colors ${connectionState === 'open' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]'
+                    }`}
+                />
+                <span>{connectionLabel}</span>
+              </div>
             </div>
           </header>
 
@@ -715,6 +911,10 @@ const App = () => {
               peer={peer}
               isTyping={typingUserId === peer?.user_id}
               connectionLabel={connectionLabel}
+              apiUrl={apiUrl}
+              authToken={authToken}
+              sessionAesKey={sessionAesKey}
+              onOpenImage={setLightboxUrl}
             />
           </section>
 
@@ -729,6 +929,47 @@ const App = () => {
               </div>
 
               <div className="flex flex-col gap-3 sm:flex-row sm:items-end relative">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={ACCEPTED_IMAGE_TYPES.join(',')}
+                  className="hidden"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    // Reset first so picking the same file twice still fires.
+                    event.target.value = '';
+                    if (file) {
+                      void handlePhotoSelected(file);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!sessionAesKey || isUploadingPhoto}
+                  title="Attach an encrypted photo"
+                  aria-label="Attach an encrypted photo"
+                  className="flex h-[3.25rem] w-[3.25rem] flex-shrink-0 items-center justify-center self-end rounded-[1.25rem] border border-[#f3c58840] bg-[#1b140fbf] text-[#ffc274] transition-all hover:scale-105 hover:border-[#ffc274aa] hover:bg-[#22190fd9] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
+                >
+                  {isUploadingPhoto ? (
+                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-[#ffc88140] border-t-[#ffc881]" />
+                  ) : (
+                    <svg
+                      className="h-5 w-5"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      aria-hidden="true"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
+                      />
+                    </svg>
+                  )}
+                </button>
                 <textarea
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
@@ -761,6 +1002,36 @@ const App = () => {
           </footer>
         </main>
       </div>
+
+      <CallPanel
+        status={call.status}
+        mediaKind={call.mediaKind}
+        peerName={peer?.display_name ?? 'Peer'}
+        localStream={call.localStream}
+        remoteStream={call.remoteStream}
+        incomingCall={call.incomingCall}
+        isMuted={call.isMuted}
+        isCameraOff={call.isCameraOff}
+        onAccept={() => void call.acceptCall()}
+        onReject={call.rejectCall}
+        onHangUp={call.hangUp}
+        onToggleMute={call.toggleMute}
+        onToggleCamera={call.toggleCamera}
+      />
+
+      {lightboxUrl ? (
+        <div
+          role="presentation"
+          onClick={() => setLightboxUrl(null)}
+          className="fixed inset-0 z-40 flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
+        >
+          <img
+            src={lightboxUrl}
+            alt="Decrypted attachment"
+            className="max-h-full max-w-full rounded-2xl object-contain shadow-2xl"
+          />
+        </div>
+      ) : null}
     </div>
   );
 };

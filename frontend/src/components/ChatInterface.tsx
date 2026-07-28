@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { EncryptedImage } from './EncryptedImage';
 import type { BootstrapChatMember, BootstrapUser, DisplayMessage } from '../types/chat';
 
 interface ChatInterfaceProps {
@@ -7,6 +8,10 @@ interface ChatInterfaceProps {
   peer: BootstrapChatMember | null;
   isTyping: boolean;
   connectionLabel: string;
+  apiUrl: string;
+  authToken: string | null;
+  sessionAesKey: CryptoKey | null;
+  onOpenImage?: (objectUrl: string) => void;
 }
 
 export const ChatInterface = ({
@@ -15,6 +20,10 @@ export const ChatInterface = ({
   peer,
   isTyping,
   connectionLabel,
+  apiUrl,
+  authToken,
+  sessionAesKey,
+  onOpenImage,
 }: ChatInterfaceProps) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -66,13 +75,31 @@ export const ChatInterface = ({
                     </span>
                   ) : null}
                   <div
-                    className={`px-4 py-2 rounded-2xl ${
+                    className={`rounded-2xl ${message.attachment ? 'p-2' : 'px-4 py-2'} ${
                       isOwn
                         ? 'rounded-br-md border border-[#5abf9d66] bg-gradient-to-br from-[#3f8d74] to-[#255547] text-[#f2fff9] shadow-[0_8px_24px_-14px_rgba(61,167,131,0.9)]'
                         : 'rounded-bl-md border border-[#f3cf9a55] bg-gradient-to-br from-[#2c2117] to-[#19130d] text-[#ffe9cb] shadow-[0_10px_24px_-14px_rgba(255,193,112,0.4)]'
                     }`}
                   >
-                    <p className="text-sm leading-relaxed break-words">{message.body}</p>
+                    {message.attachment ? (
+                      <EncryptedImage
+                        attachment={message.attachment}
+                        apiUrl={apiUrl}
+                        authToken={authToken}
+                        sessionAesKey={sessionAesKey}
+                        onOpen={onOpenImage}
+                      />
+                    ) : null}
+
+                    {message.body ? (
+                      <p
+                        className={`text-sm leading-relaxed break-words ${
+                          message.attachment ? 'px-2 pb-1 pt-2' : ''
+                        }`}
+                      >
+                        {message.body}
+                      </p>
+                    ) : null}
                   </div>
                   
                   <div className={`mt-1.5 flex items-center gap-1 px-1 text-[11px] text-[#9d8a72] ${isOwn ? 'flex-row-reverse' : 'flex-row'}`}>
