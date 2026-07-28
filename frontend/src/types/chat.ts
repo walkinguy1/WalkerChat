@@ -34,14 +34,59 @@ export type ImageAttachment = {
 };
 
 /**
+ * Reference to the message being replied to.
+ *
+ * The preview is a copy of the quoted plaintext rather than a lookup, so a
+ * reply still renders its quote when the original is outside loaded history.
+ */
+export type ReplyRef = {
+  message_id: string;
+  sender_id: string;
+  preview: string;
+};
+
+/**
  * Decrypted message body. Plain text messages are stored as a bare string for
- * backward compatibility; anything with an attachment uses this envelope,
- * tagged with `_wc` so a user typing raw JSON is not mistaken for one.
+ * backward compatibility; anything with an attachment or a reply uses this
+ * envelope, tagged with `_wc` so a user typing raw JSON is not mistaken for one.
  */
 export type StructuredMessagePayload = {
   _wc: 1;
+  kind?: 'message';
   caption: string;
-  attachment: ImageAttachment;
+  attachment?: ImageAttachment;
+  reply_to?: ReplyRef;
+};
+
+/**
+ * A reaction travels as an ordinary encrypted message rather than a plaintext
+ * column, so the server learns only that a message was sent — never which
+ * message was reacted to, nor with what.
+ */
+export type ReactionPayload = {
+  _wc: 1;
+  kind: 'reaction';
+  target_message_id: string;
+  emoji: string;
+  action: 'add' | 'remove';
+};
+
+export type MessageEnvelope = StructuredMessagePayload | ReactionPayload;
+
+/** A decoded reaction, tagged with who sent it and when it was sent. */
+export type ReactionEvent = {
+  id: string;
+  targetMessageId: string;
+  senderId: string;
+  emoji: string;
+  action: 'add' | 'remove';
+  sentAt: string;
+};
+
+/** Folded reaction state for one message: an emoji and who chose it. */
+export type ReactionTally = {
+  emoji: string;
+  userIds: string[];
 };
 
 export type ChatMessageRecord = {
@@ -116,6 +161,7 @@ export type DisplayMessage = {
   senderId: string;
   body: string;
   attachment?: ImageAttachment;
+  replyTo?: ReplyRef;
   sentAt: string;
   state: 'sending' | 'sent';
 };
@@ -140,6 +186,9 @@ export type BootstrapChat = {
   id: string;
   name: string;
   type: string;
+  /** Drives the Rooms / Direct split in the sidebar. */
+  kind: 'room' | 'direct';
+  member_count: number;
   summary: string;
   members: BootstrapChatMember[];
 };

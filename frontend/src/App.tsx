@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import clsx from 'clsx';
 import {
   fetchBootstrap,
   fetchHistory,
@@ -22,42 +23,51 @@ import {
   mergeMessages,
   resolveDisplayMessage,
 } from './lib/chat';
-import { ACCEPTED_IMAGE_TYPES, encryptAndUploadImage } from './lib/media';
+import { encryptAndUploadImage } from './lib/media';
+import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useWebRTC, type OutboundSignal } from './hooks/useWebRTC';
-import { ChatInterface } from './components/ChatInterface';
-import { CallPanel } from './components/CallPanel';
+import { SignIn, type DemoAccount } from './components/SignIn';
+import { Sidebar, type ConversationSummary } from './components/Sidebar';
+import { ChatHeader } from './components/ChatHeader';
+import { MessageList, type HistoryState } from './components/MessageList';
+import { Composer } from './components/Composer';
+import { CallOverlay } from './components/CallOverlay';
+import { Lightbox, type LightboxImage } from './components/Lightbox';
+import { Toaster } from './components/ui/Toaster';
+import { Logo } from './components/ui/Logo';
 import type {
   BootstrapResponse,
   CallMediaKind,
   ChatMessageEvent,
+  ChatMessageRecord,
   DisplayMessage,
   ImageAttachment,
   RealtimeEvent,
   WebRtcSignalEvent,
 } from './types/chat';
 
-const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
-  { urls: ['stun:stun.l.google.com:19302'] },
-];
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: ['stun:stun.l.google.com:19302'] }];
 
 const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 const wsBaseUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
 
-const demoAccounts = [
+const demoAccounts: readonly DemoAccount[] = [
   {
     username: 'alice',
     password: 'walkerchat123',
     displayName: 'Alice Walker',
     initials: 'AW',
+    role: 'Field lead',
   },
   {
     username: 'bob',
     password: 'walkerchat123',
     displayName: 'Bob Stone',
     initials: 'BS',
+    role: 'Operations',
   },
-] as const;
+];
 
 const App = () => {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
@@ -65,14 +75,15 @@ const App = () => {
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
-  const [historyState, setHistoryState] = useState<'idle' | 'loading' | 'ready' | 'error'>(
-    'idle',
-  );
+  /** Raw ciphertext records; decrypted by a separate effect once a key exists. */
+  const [historyRecords, setHistoryRecords] = useState<ChatMessageRecord[]>([]);
+  const [historyState, setHistoryState] = useState<HistoryState>('idle');
+  /** Which thread the state above belongs to, so a switch can reset it. */
+  const [loadedChatId, setLoadedChatId] = useState<string | null>(null);
   const [bootstrapState, setBootstrapState] = useState<
     'signed_out' | 'loading' | 'ready' | 'error'
   >('signed_out');
   const [typingUserId, setTypingUserId] = useState<string | null>(null);
-  const [errorNotice, setErrorNotice] = useState<string | null>(null);
   const [presenceByUserId, setPresenceByUserId] = useState<Record<string, 'online' | 'offline'>>(
     {},
   );
@@ -80,33 +91,36 @@ const App = () => {
   const [wsTicket, setWsTicket] = useState<string | null>(null);
   const [myKeys, setMyKeys] = useState<KeyBundle | null>(null);
   const [sessionAesKey, setSessionAesKey] = useState<CryptoKey | null>(null);
-  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [signingInUsername, setSigningInUsername] = useState<string | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
-  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
   const typingTimeoutRef = useRef<number | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   // Set after useWebRTC initialises, so the socket handler below can reach it
   // without the two hooks depending on each other.
   const handleSignalRef = useRef<((signal: WebRtcSignalEvent) => void) | null>(null);
 
-  const currentUser = useMemo(() => {
-    const currentUser = bootstrap?.users.find((user) => user.id === selectedUserId);
-    return currentUser ?? null;
-  }, [bootstrap, selectedUserId]);
+  const currentUser = useMemo(
+    () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
+    [bootstrap, selectedUserId],
+  );
 
-  const activeChat = useMemo(() => {
-    const activeChat = bootstrap?.chats.find((chat) => chat.id === activeChatId);
-    return activeChat ?? null;
-  }, [activeChatId, bootstrap]);
+  const activeChat = useMemo(
+    () => bootstrap?.chats.find((chat) => chat.id === activeChatId) ?? null,
+    [activeChatId, bootstrap],
+  );
 
   const peer = useMemo(() => {
     if (!activeChat || !currentUser) return null;
-    const peer = activeChat.members.find((member) => member.user_id !== currentUser.id);
-    return peer ?? null;
+    return activeChat.members.find((member) => member.user_id !== currentUser.id) ?? null;
   }, [activeChat, currentUser]);
 
-  const socketUrl = wsTicket ? `${wsBaseUrl}/api/ws/chat?ticket=${encodeURIComponent(wsTicket)}` : null;
+  const socketUrl = wsTicket
+    ? `${wsBaseUrl}/api/ws/chat?ticket=${encodeURIComponent(wsTicket)}`
+    : null;
 
   const { connectionState, sendMessage } = useWebSocket<RealtimeEvent>(socketUrl, {
     onMessage: (message) => {
@@ -148,16 +162,18 @@ const App = () => {
       }
 
       if (message.type === 'error') {
-        setErrorNotice(message.detail);
+        pushToast(message.detail);
       }
     },
     onClose: (event) => {
       if (event.code === 4001) {
         setWsTicket(null);
-        setErrorNotice('Your secure session expired. Sign in again to continue.');
+        pushToast('Your secure session expired. Sign in again to continue.');
       }
     },
   });
+
+  const isSocketOpen = connectionState === 'open';
 
   const sendCallSignal = useCallback(
     (signal: OutboundSignal) => {
@@ -184,7 +200,7 @@ const App = () => {
   const call = useWebRTC({
     sendSignal: sendCallSignal,
     iceServers,
-    onError: (message) => setErrorNotice(message),
+    onError: (message) => pushToast(message),
   });
 
   useEffect(() => {
@@ -236,16 +252,10 @@ const App = () => {
         }
 
         setBootstrap(bootstrapPayload);
-        setSelectedUserId(
-          (currentValue) => currentValue ?? bootstrapPayload.users[0]?.id ?? null,
-        );
-        setActiveChatId(
-          (currentValue) => currentValue ?? bootstrapPayload.chats[0]?.id ?? null,
-        );
+        setSelectedUserId((currentValue) => currentValue ?? bootstrapPayload.users[0]?.id ?? null);
+        setActiveChatId((currentValue) => currentValue ?? bootstrapPayload.chats[0]?.id ?? null);
         setPresenceByUserId(
-          Object.fromEntries(
-            bootstrapPayload.users.map((user) => [user.id, user.presence_state]),
-          ),
+          Object.fromEntries(bootstrapPayload.users.map((user) => [user.id, user.presence_state])),
         );
         setWsTicket(ticketPayload.ticket);
         setBootstrapState('ready');
@@ -253,7 +263,7 @@ const App = () => {
         console.error('Unable to load authenticated bootstrap data.', error);
         if (isActive) {
           setBootstrapState('error');
-          setErrorNotice(error instanceof Error ? error.message : 'Unable to load session.');
+          pushToast(error instanceof Error ? error.message : 'Unable to load session.');
         }
       }
     };
@@ -265,78 +275,74 @@ const App = () => {
     };
   }, [authToken]);
 
+  // Reset thread-scoped state during render rather than in an effect, so the
+  // outgoing thread's messages never paint into the incoming one for a frame.
+  if (activeChatId !== loadedChatId) {
+    setLoadedChatId(activeChatId);
+    setMessages([]);
+    setHistoryRecords([]);
+    setTypingUserId(null);
+    setHistoryState(activeChatId ? 'loading' : 'idle');
+  }
+
+  /**
+   * Fetch ciphertext for the open thread.
+   *
+   * Deliberately does not depend on the session key: decryption is a separate
+   * effect below. Keeping them apart stops the key arriving from re-triggering
+   * a network round trip for history we already hold.
+   */
   useEffect(() => {
-    if (!activeChat || !currentUser || !authToken) {
+    if (!activeChatId || !authToken) {
       return;
     }
 
     let isActive = true;
 
-    const loadHistory = async () => {
-      setMessages([]);
-      setTypingUserId(null);
-      setErrorNotice(null);
-      setHistoryState('loading');
-
-      try {
-        const payload = await fetchHistory(apiUrl, activeChat.id, authToken);
-        
-        // Ensure we have a session key before decrypting messages
-        let activeAesKey = sessionAesKey;
-        if (!activeAesKey && peer && myKeys) {
-          console.log('Establishing session key for history decryption...');
-          try {
-            const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
-            const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
-            if (preferredPeerKey === 'pending-client-upload') {
-              throw new Error('Peer has not uploaded keys yet.');
-            }
-            const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
-            setSessionAesKey(session.sharedKey);
-            activeAesKey = session.sharedKey;
-          } catch (error) {
-            console.error('Failed to establish session for history:', error);
-            // Load messages without decryption
-            const displayMessages = payload.items.map((message) => ({
-              id: message.message_id,
-              clientMessageId: message.message_id,
-              serverMessageId: message.message_id,
-              senderId: message.sender_id,
-              body: '[Encryption key required]',
-              sentAt: message.sent_at,
-              state: 'sent' as const,
-            }));
-            setMessages(displayMessages);
-            setHistoryState('ready');
-            return;
-          }
-        }
-
-        const displayMessages = await Promise.all(
-          payload.items.map((message) => resolveDisplayMessage(message, activeAesKey)),
-        );
-        if (!isActive) {
-          return;
-        }
-
-        setMessages(displayMessages);
+    fetchHistory(apiUrl, activeChatId, authToken)
+      .then((payload) => {
+        if (!isActive) return;
+        setHistoryRecords(payload.items);
         setHistoryState('ready');
-      } catch (error) {
+      })
+      .catch((error) => {
         console.error('Unable to load encrypted history.', error);
-        if (isActive) {
-          setHistoryState('error');
-          setErrorNotice(error instanceof Error ? error.message : 'Unable to load history.');
-        }
-      }
-    };
-
-    void loadHistory();
+        if (!isActive) return;
+        setHistoryState('error');
+        pushToast(error instanceof Error ? error.message : 'Unable to load history.');
+      });
 
     return () => {
       isActive = false;
     };
-  }, [activeChat, authToken, currentUser, sessionAesKey, peer, myKeys]);
+  }, [activeChatId, authToken]);
 
+  /**
+   * Decrypt whatever history we hold. Re-runs when the key lands, so messages
+   * that first rendered as locked placeholders resolve in place.
+   */
+  useEffect(() => {
+    if (!historyRecords.length) {
+      return;
+    }
+
+    let isActive = true;
+
+    void Promise.all(
+      historyRecords.map((record) => resolveDisplayMessage(record, sessionAesKey)),
+    ).then((decrypted) => {
+      if (!isActive) return;
+      // Fold through mergeMessages so live messages that arrived while we were
+      // decrypting are preserved rather than overwritten.
+      setMessages((previousMessages) => decrypted.reduce(mergeMessages, previousMessages));
+    });
+
+    return () => {
+      isActive = false;
+    };
+  }, [historyRecords, sessionAesKey]);
+
+  /** Establish the shared AES key for the open thread. */
   useEffect(() => {
     if (!peer || !myKeys || !authToken) {
       return;
@@ -348,6 +354,9 @@ const App = () => {
       try {
         const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
         const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
+        if (preferredPeerKey === 'pending-client-upload') {
+          throw new Error('This peer has not uploaded their keys yet.');
+        }
         const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
         if (isActive) {
           setSessionAesKey(session.sharedKey);
@@ -356,7 +365,11 @@ const App = () => {
         console.error('Failed to establish secure session.', error);
         if (isActive) {
           setSessionAesKey(null);
-          setErrorNotice('Unable to establish a secure session for this chat.');
+          pushToast(
+            error instanceof Error
+              ? error.message
+              : 'Unable to establish a secure session for this chat.',
+          );
         }
       }
     };
@@ -368,43 +381,32 @@ const App = () => {
     };
   }, [authToken, myKeys, peer]);
 
+  /** Broadcast typing state, debounced back to idle after a pause. */
   useEffect(() => {
     if (!activeChat || !currentUser || !peer) {
       return;
     }
 
-    if (!draft.trim()) {
+    const emitTyping = (isTyping: boolean) =>
       sendMessage({
         type: 'typing',
         chat_id: activeChat.id,
         sender_id: currentUser.id,
         target_id: peer.user_id,
-        is_typing: false,
+        is_typing: isTyping,
       });
+
+    if (!draft.trim()) {
+      emitTyping(false);
       return;
     }
 
-    sendMessage({
-      type: 'typing',
-      chat_id: activeChat.id,
-      sender_id: currentUser.id,
-      target_id: peer.user_id,
-      is_typing: true,
-    });
+    emitTyping(true);
 
     if (typingTimeoutRef.current !== null) {
       window.clearTimeout(typingTimeoutRef.current);
     }
-
-    typingTimeoutRef.current = window.setTimeout(() => {
-      sendMessage({
-        type: 'typing',
-        chat_id: activeChat.id,
-        sender_id: currentUser.id,
-        target_id: peer.user_id,
-        is_typing: false,
-      });
-    }, 900);
+    typingTimeoutRef.current = window.setTimeout(() => emitTyping(false), 900);
 
     return () => {
       if (typingTimeoutRef.current !== null) {
@@ -413,22 +415,34 @@ const App = () => {
     };
   }, [activeChat, currentUser, draft, peer, sendMessage]);
 
-  const connectionLabel = useMemo(() => {
-    switch (connectionState) {
-      case 'open':
-        return 'Live secure session';
-      case 'connecting':
-        return 'Connecting secure session';
-      case 'error':
-        return 'Transport error';
-      default:
-        return wsTicket ? 'Reconnecting secure session' : 'Waiting for secure socket ticket';
-    }
-  }, [connectionState, wsTicket]);
+  /** `/` focuses search, Escape closes whatever overlay is open. */
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isEditing =
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.isContentEditable;
 
-  const handleSignIn = async (username: string, password: string) => {
-    setIsSigningIn(true);
-    setErrorNotice(null);
+      if (event.key === '/' && !isEditing) {
+        event.preventDefault();
+        setIsSidebarOpen(true);
+        searchInputRef.current?.focus();
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        setIsSidebarOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  const handleSignIn = async (account: DemoAccount) => {
+    setSigningInUsername(account.username);
+    clearToasts();
 
     try {
       if (authToken) {
@@ -443,8 +457,8 @@ const App = () => {
       setSessionAesKey(null);
       setWsTicket(null);
 
-      const tokenData = await login(apiUrl, username, password);
-      const keys = await getOrCreateKeyPair(username);
+      const tokenData = await login(apiUrl, account.username, account.password);
+      const keys = await getOrCreateKeyPair(account.username);
       await uploadIdentityKeys(
         apiUrl,
         tokenData.access_token,
@@ -459,13 +473,13 @@ const App = () => {
       setTypingUserId(null);
     } catch (error) {
       console.error('Login failed.', error);
-      setErrorNotice(error instanceof Error ? error.message : 'Login failed.');
+      pushToast(error instanceof Error ? error.message : 'Login failed.');
     } finally {
-      setIsSigningIn(false);
+      setSigningInUsername(null);
     }
   };
 
-  const handleLogout = async () => {
+  const handleSignOut = async () => {
     try {
       if (authToken) {
         await logout(apiUrl, authToken);
@@ -474,15 +488,21 @@ const App = () => {
       console.error('Logout failed.', error);
     } finally {
       clearAllSessions();
+      clearToasts();
       setAuthToken(null);
       setWsTicket(null);
       setMyKeys(null);
       setSessionAesKey(null);
       setSelectedUserId(null);
       setActiveChatId(null);
+      setBootstrap(null);
+      setBootstrapState('signed_out');
+      setMessages([]);
+      setHistoryRecords([]);
+      setHistoryState('idle');
       setDraft('');
       setTypingUserId(null);
-      setErrorNotice(null);
+      setIsSidebarOpen(false);
     }
   };
 
@@ -498,7 +518,7 @@ const App = () => {
     }
 
     if (!peer || !myKeys || !authToken) {
-      setErrorNotice('Secure session is not ready yet. Wait for key exchange to finish.');
+      pushToast('The secure session is not ready yet. Wait for the key exchange to finish.');
       return null;
     }
 
@@ -506,16 +526,16 @@ const App = () => {
       const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
       const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
       if (preferredPeerKey === 'pending-client-upload') {
-        throw new Error('Peer has not uploaded keys yet.');
+        throw new Error('This peer has not uploaded their keys yet.');
       }
       const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
       setSessionAesKey(session.sharedKey);
       return session.sharedKey;
-    } catch (err) {
-      setErrorNotice(
-        err instanceof Error
-          ? err.message
-          : 'Secure session could not be established. Ensure peer is active.',
+    } catch (error) {
+      pushToast(
+        error instanceof Error
+          ? error.message
+          : 'The secure session could not be established. Make sure the peer is active.',
       );
       return null;
     }
@@ -531,10 +551,7 @@ const App = () => {
       return false;
     }
 
-    const ciphertext = await encryptMessage(
-      encodeMessagePayload(caption, attachment),
-      aesKey,
-    );
+    const ciphertext = await encryptMessage(encodeMessagePayload(caption, attachment), aesKey);
 
     const outboundMessage: ChatMessageEvent = {
       type: 'chat_message',
@@ -559,9 +576,8 @@ const App = () => {
       ),
     );
 
-    const wasSent = sendMessage(outboundMessage);
-    if (!wasSent) {
-      setErrorNotice('The socket is not ready yet. Reconnect and send again.');
+    if (!sendMessage(outboundMessage)) {
+      pushToast('The socket is not connected yet. Reconnect and send again.');
       return false;
     }
 
@@ -573,17 +589,12 @@ const App = () => {
       is_typing: false,
     });
 
-    setErrorNotice(null);
     return true;
   };
 
   const handleSend = async () => {
-    if (!activeChat || !currentUser || !peer) {
-      return;
-    }
-
     const trimmedDraft = draft.trim();
-    if (!trimmedDraft) {
+    if (!trimmedDraft || !activeChat || !currentUser || !peer) {
       return;
     }
 
@@ -596,9 +607,9 @@ const App = () => {
       if (await sendEncryptedMessage(activeAesKey, trimmedDraft)) {
         setDraft('');
       }
-    } catch (err) {
-      console.error('Secure send failed.', err);
-      setErrorNotice(err instanceof Error ? err.message : 'Secure send failed.');
+    } catch (error) {
+      console.error('Secure send failed.', error);
+      pushToast(error instanceof Error ? error.message : 'Secure send failed.');
     }
   };
 
@@ -607,7 +618,7 @@ const App = () => {
    * carrying the (also encrypted) attachment descriptor. The backend stores
    * bytes it cannot read.
    */
-  const handlePhotoSelected = async (file: File) => {
+  const handleSendPhoto = async (file: File) => {
     if (!activeChat || !currentUser || !peer || !authToken) {
       return;
     }
@@ -618,7 +629,6 @@ const App = () => {
     }
 
     setIsUploadingPhoto(true);
-    setErrorNotice(null);
 
     try {
       const attachment = await encryptAndUploadImage(
@@ -632,9 +642,9 @@ const App = () => {
       if (await sendEncryptedMessage(activeAesKey, draft.trim(), attachment)) {
         setDraft('');
       }
-    } catch (err) {
-      console.error('Encrypted photo send failed.', err);
-      setErrorNotice(err instanceof Error ? err.message : 'Unable to send that photo.');
+    } catch (error) {
+      console.error('Encrypted photo send failed.', error);
+      pushToast(error instanceof Error ? error.message : 'Unable to send that photo.');
     } finally {
       setIsUploadingPhoto(false);
     }
@@ -642,371 +652,178 @@ const App = () => {
 
   const handleStartCall = async (media: CallMediaKind) => {
     if (!peer) {
-      setErrorNotice('Select a chat with a peer before starting a call.');
+      pushToast('Select a chat with a peer before starting a call.');
       return;
     }
 
-    if (connectionState !== 'open') {
-      setErrorNotice('The secure socket is not connected, so a call cannot be placed.');
+    if (!isSocketOpen) {
+      pushToast('The secure socket is not connected, so a call cannot be placed.');
       return;
     }
 
-    setErrorNotice(null);
     await call.startCall(media);
   };
 
+  /** Sidebar rows, with the newest decrypted line as the preview. */
+  const conversations = useMemo<ConversationSummary[]>(() => {
+    if (!bootstrap || !currentUser) return [];
+
+    return bootstrap.chats.map((chat) => {
+      const chatPeer = chat.members.find((member) => member.user_id !== currentUser.id);
+      const isActiveThread = chat.id === activeChatId;
+      const latest = isActiveThread ? messages[messages.length - 1] : undefined;
+
+      const preview = latest
+        ? `${latest.senderId === currentUser.id ? 'You: ' : ''}${
+            latest.attachment && !latest.body ? 'Photo' : latest.body
+          }`
+        : chat.summary;
+
+      return {
+        chat,
+        peerName: chatPeer?.display_name ?? chat.name,
+        peerInitials: chatPeer?.initials ?? '',
+        presence: chatPeer
+          ? (presenceByUserId[chatPeer.user_id] ?? chatPeer.presence_state)
+          : 'offline',
+        preview,
+        lastActivityAt: latest?.sentAt ?? null,
+        // Threads other than the open one are not streamed, so there is no
+        // honest unread count to show yet.
+        unreadCount: 0,
+      };
+    });
+  }, [activeChatId, bootstrap, currentUser, messages, presenceByUserId]);
+
   if (!authToken || bootstrapState === 'signed_out') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(ellipse_at_15%_0%,_#4a2f16_0%,_#120f0b_45%,_#080705_100%)] px-6 py-10 text-[#ffe6c5]">
-        <div className="w-full max-w-4xl rounded-3xl border border-[#f8cd9855] bg-[#120e0acc] p-10 shadow-[0_25px_90px_-35px_rgba(242,173,91,0.7)] backdrop-blur-xl transition-all">
-          <p className="text-xs font-bold uppercase tracking-[0.35em] text-[#ffbe73]">WalkerChat</p>
-          <h1 className="font-display mt-4 bg-gradient-to-r from-[#ffe6be] via-[#ffcc87] to-[#9fefc9] bg-clip-text text-5xl font-extrabold tracking-tight text-transparent">
-            Secure demo sign-in
-          </h1>
-          <p className="mt-5 max-w-2xl text-base font-light leading-7 text-[#d6b893]">
-            This build now avoids placing the main JWT in the WebSocket URL, requires
-            a secure session before sending encrypted messages, and exposes explicit
-            demo sign-in cards for seeded users.
-          </p>
-
-          {errorNotice ? (
-            <div className="mt-8 rounded-2xl border border-red-500/20 bg-red-500/10 p-5 text-sm text-red-200 backdrop-blur-md flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
-              <div className="h-2 w-2 rounded-full bg-red-400 animate-pulse" />
-              {errorNotice}
-            </div>
-          ) : null}
-
-          <div className="mt-10 grid gap-6 md:grid-cols-2">
-            {demoAccounts.map((account) => (
-              <button
-                key={account.username}
-                type="button"
-                disabled={isSigningIn}
-                onClick={() => void handleSignIn(account.username, account.password)}
-                className="group relative overflow-hidden rounded-[1.5rem] border border-[#f3c58844] bg-[#22180f99] p-6 text-left transition-all duration-300 hover:scale-[1.02] hover:border-[#ffc274aa] hover:bg-[#2d2015dd] hover:shadow-[0_0_30px_-5px_rgba(255,196,116,0.35)] disabled:opacity-50"
-              >
-                <div className="absolute inset-0 bg-gradient-to-br from-[#6ee5b500] via-[#6ee5b500] to-[#6ee5b522] opacity-0 transition-opacity duration-300 group-hover:opacity-100" />
-                <div className="relative flex items-center gap-5">
-                  <span className="flex h-16 w-16 items-center justify-center rounded-2xl border border-[#f6d09a33] bg-gradient-to-br from-[#3d2a1b] to-[#1c130d] text-lg font-bold text-[#f8cf91] shadow-inner transition-transform duration-300 group-hover:scale-110">
-                    {account.initials}
-                  </span>
-                  <div>
-                    <span className="block text-xl font-semibold tracking-wide text-[#fff0d6]">
-                      {account.displayName}
-                    </span>
-                    <span className="mt-1 block text-xs uppercase tracking-[0.25em] text-[#d6b58a]">
-                      @{account.username}
-                    </span>
-                  </div>
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
+      <>
+        <SignIn
+          accounts={demoAccounts}
+          pendingUsername={signingInUsername}
+          isSigningIn={signingInUsername !== null}
+          onSignIn={(account) => void handleSignIn(account)}
+        />
+        <Toaster />
+      </>
     );
   }
 
   if (bootstrapState === 'loading') {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(ellipse_at_center,_#3f2a19_0%,_#0f0d0a_75%)] text-[#ffdba8]">
-        <div className="flex flex-col items-center gap-4 animate-pulse">
-          <div className="h-10 w-10 animate-spin rounded-full border-4 border-[#ffc88140] border-t-[#ffc881]" />
-          <span className="text-sm uppercase tracking-widest font-semibold">Loading Workspace...</span>
-        </div>
+      <div className="flex h-full flex-col items-center justify-center gap-4">
+        <Logo className="h-11 w-11 animate-sheen" />
+        <p className="text-[13px] text-ink-muted">Restoring your encrypted workspace…</p>
       </div>
     );
   }
 
   if (bootstrapState === 'error' || !bootstrap || !currentUser || !activeChat) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-950 px-6 text-center text-slate-200 flex-col gap-4">
-        <div className="h-16 w-16 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center text-2xl border border-red-500/30">!</div>
-        <p className="max-w-md text-lg text-slate-300 font-light">Unable to load the chat bootstrap data. Check that the FastAPI backend is running.</p>
-      </div>
+      <>
+        <div className="flex h-full flex-col items-center justify-center gap-4 px-6 text-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-2xl border border-danger/30 bg-danger-soft text-lg font-semibold text-danger">
+            !
+          </span>
+          <div>
+            <h1 className="text-[15px] font-semibold">Workspace unavailable</h1>
+            <p className="mt-2 max-w-sm text-[13px] leading-6 text-ink-muted">
+              The bootstrap data could not be loaded. Check that the FastAPI backend is
+              running on {apiUrl}, then sign in again.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleSignOut()}
+            className="mt-1 rounded-field border border-line bg-raised px-4 py-2 text-sm font-medium transition-colors hover:border-line-strong"
+          >
+            Back to sign in
+          </button>
+        </div>
+        <Toaster />
+      </>
     );
   }
 
+  const peerPresence = peer
+    ? (presenceByUserId[peer.user_id] ?? peer.presence_state)
+    : 'offline';
+
   return (
-    <div className="min-h-screen bg-[radial-gradient(ellipse_at_top_right,_#48311b_0%,_#14100d_42%,_#090806_100%)] text-[#ffe9cb]">
-      <div className="mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-6 sm:px-6 lg:flex-row lg:gap-8 lg:px-8">
+    <div className="flex h-full overflow-hidden">
+      {/* Scrim for the mobile slide-over. */}
+      {isSidebarOpen ? (
+        <div
+          role="presentation"
+          onClick={() => setIsSidebarOpen(false)}
+          className="fixed inset-0 z-30 animate-fade bg-black/50 backdrop-blur-[2px] lg:hidden"
+        />
+      ) : null}
 
-        {/* SIDEBAR */}
-        <aside className="mb-6 flex w-full flex-col rounded-3xl border border-[#f3c58838] bg-[#16110dda] p-6 shadow-[0_16px_45px_-22px_rgba(0,0,0,0.85)] backdrop-blur-xl lg:mb-0 lg:w-[360px]">
-          <div className="mb-8 pl-1">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[10px] sm:text-xs font-bold uppercase tracking-[0.4em] text-[#ffbd73]">
-                  WalkerChat
-                </p>
-                <h1 className="font-display mt-2 bg-gradient-to-r from-[#ffe9c7] to-[#b4efd4] bg-clip-text text-2xl font-extrabold tracking-tight text-transparent">
-                  Encrypted Coordination
-                </h1>
-              </div>
-              <button
-                type="button"
-                onClick={() => void handleLogout()}
-                className="group flex items-center justify-center rounded-full border border-[#f3c58844] bg-[#291d13b3] px-4 py-2 text-[10px] font-bold uppercase tracking-widest text-[#e6c89f] transition-all hover:bg-[#332417] hover:text-[#fff2df]"
-              >
-                Logout
-              </button>
-            </div>
-          </div>
+      <aside
+        className={clsx(
+          'fixed inset-y-0 left-0 z-40 w-[19rem] max-w-[85vw] border-r border-line transition-transform duration-250 ease-[cubic-bezier(0.22,1,0.36,1)]',
+          'lg:static lg:z-auto lg:w-[19rem] lg:translate-x-0',
+          isSidebarOpen ? 'translate-x-0 shadow-pop' : '-translate-x-full lg:shadow-none',
+        )}
+      >
+        <Sidebar
+          ref={searchInputRef}
+          currentUser={currentUser}
+          conversations={conversations}
+          activeChatId={activeChatId}
+          isSocketOpen={isSocketOpen}
+          onSelectChat={(chatId) => {
+            setActiveChatId(chatId);
+            setIsSidebarOpen(false);
+          }}
+          onSignOut={() => void handleSignOut()}
+          onClose={() => setIsSidebarOpen(false)}
+        />
+      </aside>
 
-          <section className="mb-6 space-y-4">
-            <div className="pl-1">
-              <p className="text-[10px] font-bold uppercase tracking-widest text-[#aa8b65]">Operate As</p>
-            </div>
-            <div className="grid gap-3">
-              {bootstrap.users.map((user) => (
-                <button
-                  key={user.id}
-                  type="button"
-                  onClick={() => {
-                    const matchingAccount = demoAccounts.find(
-                      (account) => account.username === user.username,
-                    );
-                    if (matchingAccount) {
-                      void handleSignIn(matchingAccount.username, matchingAccount.password);
-                    }
-                  }}
-                  className={`group relative overflow-hidden flex items-center gap-4 rounded-2xl border px-4 py-3 text-left transition-all duration-300 ${selectedUserId === user.id
-                    ? 'border-[#ffd19066] bg-gradient-to-r from-[#4a341f] to-[#1f2820] text-[#fff2de] shadow-[0_0_20px_-7px_rgba(255,186,105,0.35)]'
-                    : 'border-[#f3c5882b] bg-[#241a12b0] text-[#d9be9a] hover:scale-[1.02] hover:bg-[#2b1f15]'
-                    }`}
-                >
-                  <span className={`flex h-12 w-12 items-center justify-center rounded-xl text-sm font-bold shadow-inner ${selectedUserId === user.id ? 'bg-[#ffc274] text-[#261709]' : 'bg-[#3a291b] text-[#ffd39a]'}`}>
-                    {user.initials}
-                  </span>
-                  <div>
-                    <span className="block text-sm font-bold tracking-wide">{user.display_name}</span>
-                    <span className="mt-0.5 block text-[10px] uppercase tracking-widest text-[#ab8e6b] group-hover:text-[#ecc389]">
-                      @{user.username}
-                    </span>
-                  </div>
-                </button>
-              ))}
-            </div>
-          </section>
+      <main className="flex min-w-0 flex-1 flex-col bg-canvas">
+        <ChatHeader
+          chat={activeChat}
+          peer={peer}
+          peerPresence={peerPresence}
+          connectionState={connectionState}
+          isSecure={Boolean(sessionAesKey)}
+          isPeerTyping={typingUserId === peer?.user_id}
+          canCall={Boolean(peer) && !call.isCallActive && isSocketOpen}
+          onStartCall={(media) => void handleStartCall(media)}
+          onOpenSidebar={() => setIsSidebarOpen(true)}
+        />
 
-          <section className="mt-auto rounded-3xl border border-[#f3c5884a] bg-gradient-to-br from-[#322315] to-[#17201b] p-5 backdrop-blur-md">
-            <div className="flex items-center gap-2 mb-4">
-              <div className="h-2 w-2 rounded-full bg-[#ffc274] animate-pulse shadow-[0_0_8px_rgba(255,194,116,0.8)]" />
-              <p className="text-[10px] font-bold uppercase tracking-widest text-[#ffd49c]">
-                Active Thread
-              </p>
-            </div>
-            <h2 className="font-display mb-2 text-xl font-bold tracking-tight text-[#fff0d7]">{activeChat.name}</h2>
-            <p className="mb-5 text-xs leading-relaxed text-[#cfb392]">{activeChat.summary}</p>
+        <MessageList
+          messages={messages}
+          currentUser={currentUser}
+          peer={peer}
+          isPeerTyping={typingUserId === peer?.user_id}
+          historyState={historyState}
+          apiUrl={apiUrl}
+          authToken={authToken}
+          sessionAesKey={sessionAesKey}
+          onOpenImage={(url, name) => setLightboxImage({ url, name })}
+        />
 
-            <div className="space-y-3">
-              {activeChat.members.map((member) => {
-                const presence =
-                  member.user_id === currentUser.id
-                    ? connectionState === 'open'
-                      ? 'online'
-                      : 'offline'
-                    : presenceByUserId[member.user_id] ?? member.presence_state;
+        <Composer
+          draft={draft}
+          onDraftChange={setDraft}
+          onSend={() => void handleSend()}
+          onSendPhoto={(file) => void handleSendPhoto(file)}
+          isSecure={Boolean(sessionAesKey)}
+          isUploading={isUploadingPhoto}
+          isSocketOpen={isSocketOpen}
+          peerName={peer?.display_name ?? activeChat.name}
+        />
+      </main>
 
-                return (
-                  <button
-                    key={member.user_id}
-                    type="button"
-                    onClick={() => setActiveChatId(activeChat.id)}
-                    className="group relative flex w-full items-center gap-3 rounded-2xl border border-[#f3c5882b] bg-[#1d1611d4] px-3 py-3 text-left transition hover:bg-[#2a1f15]"
-                  >
-                    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#3a291b] text-xs font-bold text-[#ffd49f] shadow-inner transition-colors group-hover:bg-[#4b3522]">
-                      {member.initials}
-                    </span>
-                    <span className="flex-1">
-                      <span className="block text-sm font-bold tracking-wide text-[#fff1dd]">
-                        {member.display_name}
-                      </span>
-                    </span>
-                    <span className="flex items-center gap-2 pr-1 text-[10px] font-bold uppercase tracking-widest text-[#a48764]">
-                      <span
-                        className={`transition-colors h-2 w-2 rounded-full shadow-sm ${presence === 'online' ? 'bg-emerald-400 shadow-emerald-400/50' : 'bg-slate-600'
-                          }`}
-                      />
-                      {presence}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-        </aside>
-
-        {/* MAIN CHAT AREA */}
-        <main className="relative flex min-h-[600px] flex-1 flex-col overflow-hidden rounded-3xl border border-[#f3c58840] bg-[#130f0be0] shadow-2xl shadow-black/70 backdrop-blur-xl lg:min-h-[720px]">
-          <div className="pointer-events-none absolute right-0 top-0 h-96 w-96 rounded-full bg-[#ffc2741f] blur-[110px]" />
-          <div className="pointer-events-none absolute bottom-[-120px] left-[-120px] h-80 w-80 rounded-full bg-[#67d8ad1c] blur-[100px]" />
-
-          <header className="relative flex flex-col gap-4 border-b border-[#f3c58838] bg-[#2a1f1496] px-6 py-5 sm:flex-row sm:items-center sm:justify-between sm:px-8">
-            <div>
-              <p className="text-[10px] font-bold uppercase tracking-[0.25em] text-[#ffc274]">
-                Secure Channel
-              </p>
-              <h2 className="font-display mt-1 text-3xl font-extrabold tracking-tight text-[#fff2de]">{activeChat.name}</h2>
-              <p className="mt-1 text-xs text-[#bfa27f]">
-                Signed in as <span className="font-semibold text-[#fff1dd]">{currentUser.display_name}</span>
-                {peer ? `, chatting with ${peer.display_name}` : ''}
-              </p>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                onClick={() => void handleStartCall('audio')}
-                disabled={!peer || call.isCallActive || connectionState !== 'open'}
-                title="Start a voice call"
-                className="rounded-full border border-[#f3c58844] bg-[#291d13b3] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e6c89f] transition-all hover:scale-105 hover:bg-[#332417] hover:text-[#fff2df] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
-              >
-                Voice
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleStartCall('video')}
-                disabled={!peer || call.isCallActive || connectionState !== 'open'}
-                title="Start a video call"
-                className="rounded-full bg-gradient-to-r from-[#ffc274] to-[#74d7b0] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#231509] shadow-lg shadow-[#ffc2743d] transition-all hover:scale-105 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
-              >
-                Video
-              </button>
-
-              <div className="flex items-center gap-3 rounded-full border border-[#f3c58844] bg-[#170f09bd] px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-[#e1c5a0] backdrop-blur-sm">
-                <span
-                  className={`h-2 w-2 rounded-full transition-colors ${connectionState === 'open' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]' : 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]'
-                    }`}
-                />
-                <span>{connectionLabel}</span>
-              </div>
-            </div>
-          </header>
-
-          <section className="relative flex flex-1 flex-col overflow-y-auto px-6 py-8 scroll-smooth sm:px-8">
-            {errorNotice ? (
-              <div className="mb-6 rounded-2xl border border-red-500/20 bg-red-500/10 p-4 text-sm text-red-200 backdrop-blur flex items-center gap-3 animate-in fade-in slide-in-from-top-2">
-                <div className="h-2 w-2 rounded-full bg-red-400 animate-pulse" />
-                {errorNotice}
-              </div>
-            ) : null}
-
-            {historyState === 'loading' ? (
-              <div className="mb-5 inline-flex w-fit items-center gap-2 rounded-full border border-[#f3c58845] bg-[#2a1f1590] px-4 py-1.5 text-xs uppercase tracking-[0.2em] text-[#f3cf9d]">
-                <span className="h-2 w-2 animate-pulse rounded-full bg-[#ffc274]" />
-                Syncing encrypted history
-              </div>
-            ) : null}
-
-            {historyState === 'ready' && messages.length === 0 ? (
-              <div className="mb-5 rounded-2xl border border-[#f3c58830] bg-[#1b140fad] p-4 text-sm text-[#d6b792]">
-                No encrypted messages yet. Start the thread with a secure envelope.
-              </div>
-            ) : null}
-
-            <ChatInterface
-              messages={messages}
-              currentUser={currentUser}
-              peer={peer}
-              isTyping={typingUserId === peer?.user_id}
-              connectionLabel={connectionLabel}
-              apiUrl={apiUrl}
-              authToken={authToken}
-              sessionAesKey={sessionAesKey}
-              onOpenImage={setLightboxUrl}
-            />
-          </section>
-
-          <footer className="relative border-t border-[#f3c5883a] bg-[#1a130dc4] px-6 py-5 backdrop-blur-xl sm:px-8">
-            <div className="rounded-[1.75rem] border border-[#f3c5884a] bg-[#0f0b08cc] p-3 shadow-inner">
-              <div className="mb-3 flex items-center justify-between gap-3 px-2 text-[10px] font-bold uppercase tracking-widest">
-                <span className="text-[#ffc274]">{currentUser.display_name}</span>
-                <span className={`flex items-center gap-2 ${sessionAesKey ? 'text-emerald-400' : 'text-[#7a6449]'}`}>
-                  {sessionAesKey && <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse border border-emerald-300 shadow-[0_0_8px_rgba(52,211,153,0.8)]" />}
-                  {sessionAesKey ? 'AES-GCM session active' : 'Waiting for session key'}
-                </span>
-              </div>
-
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-end relative">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept={ACCEPTED_IMAGE_TYPES.join(',')}
-                  className="hidden"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    // Reset first so picking the same file twice still fires.
-                    event.target.value = '';
-                    if (file) {
-                      void handlePhotoSelected(file);
-                    }
-                  }}
-                />
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={!sessionAesKey || isUploadingPhoto}
-                  title="Attach an encrypted photo"
-                  aria-label="Attach an encrypted photo"
-                  className="flex h-[3.25rem] w-[3.25rem] flex-shrink-0 items-center justify-center self-end rounded-[1.25rem] border border-[#f3c58840] bg-[#1b140fbf] text-[#ffc274] transition-all hover:scale-105 hover:border-[#ffc274aa] hover:bg-[#22190fd9] disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:scale-100"
-                >
-                  {isUploadingPhoto ? (
-                    <span className="h-5 w-5 animate-spin rounded-full border-2 border-[#ffc88140] border-t-[#ffc881]" />
-                  ) : (
-                    <svg
-                      className="h-5 w-5"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      aria-hidden="true"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
-                      />
-                    </svg>
-                  )}
-                </button>
-                <textarea
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && !event.shiftKey) {
-                      event.preventDefault();
-                      void handleSend();
-                    }
-                  }}
-                  rows={2}
-                  placeholder="Compose an encrypted message envelope..."
-                  className="min-h-[5rem] flex-1 resize-none rounded-[1.25rem] border border-[#f3c58840] bg-[#1b140fbf] px-5 py-4 text-[15px] font-light text-[#ffe9ca] outline-none transition-all placeholder:text-[#8f775a] focus:border-[#ffc274aa] focus:bg-[#22190fd9] focus:shadow-[0_0_20px_-7px_rgba(255,194,116,0.6)]"
-                />
-                <button
-                  type="button"
-                  onClick={() => void handleSend()}
-                  disabled={!draft.trim() || !sessionAesKey}
-                  className="group relative flex-shrink-0 overflow-hidden rounded-[1.25rem] bg-gradient-to-r from-[#ffc274] to-[#74d7b0] px-4 py-2 text-xs font-bold text-[#231509] shadow-lg shadow-[#ffc2743d] transition-all hover:scale-105 hover:shadow-[#ffc27475] active:scale-95 disabled:hover:scale-100 disabled:opacity-50 disabled:shadow-none whitespace-nowrap"
-                >
-                  <div className="absolute inset-0 bg-white/20 opacity-0 transition-opacity group-hover:opacity-100" />
-                  <span className="relative flex items-center gap-2">
-                    Send Securely
-                    <svg className="w-4 h-4 transition-transform group-hover:translate-x-1 group-active:translate-x-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                    </svg>
-                  </span>
-                </button>
-              </div>
-            </div>
-          </footer>
-        </main>
-      </div>
-
-      <CallPanel
+      <CallOverlay
         status={call.status}
         mediaKind={call.mediaKind}
         peerName={peer?.display_name ?? 'Peer'}
+        peerInitials={peer?.initials}
         localStream={call.localStream}
         remoteStream={call.remoteStream}
         incomingCall={call.incomingCall}
@@ -1019,19 +836,8 @@ const App = () => {
         onToggleCamera={call.toggleCamera}
       />
 
-      {lightboxUrl ? (
-        <div
-          role="presentation"
-          onClick={() => setLightboxUrl(null)}
-          className="fixed inset-0 z-40 flex items-center justify-center bg-black/90 p-6 backdrop-blur-sm"
-        >
-          <img
-            src={lightboxUrl}
-            alt="Decrypted attachment"
-            className="max-h-full max-w-full rounded-2xl object-contain shadow-2xl"
-          />
-        </div>
-      ) : null}
+      <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
+      <Toaster />
     </div>
   );
 };

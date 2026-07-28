@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ImageOff, Lock } from 'lucide-react';
 import { downloadAndDecryptImage } from '../lib/media';
 import type { ImageAttachment } from '../types/chat';
 
@@ -7,7 +8,7 @@ interface EncryptedImageProps {
   apiUrl: string;
   authToken: string | null;
   sessionAesKey: CryptoKey | null;
-  onOpen?: (objectUrl: string) => void;
+  onOpen?: (objectUrl: string, name: string) => void;
 }
 
 type LoadState = 'idle' | 'loading' | 'ready' | 'error';
@@ -85,8 +86,11 @@ export const EncryptedImage = ({
 
   if (loadState === 'error') {
     return (
-      <div className="flex min-h-[8rem] w-64 items-center justify-center rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-6 text-center text-xs text-red-200">
-        {errorDetail ?? 'Unable to decrypt this image.'}
+      <div className="flex w-60 max-w-full flex-col items-center justify-center gap-2 rounded-xl border border-danger/30 bg-danger-soft px-4 py-8 text-center">
+        <ImageOff className="h-5 w-5 text-danger" aria-hidden="true" />
+        <span className="text-[12px] leading-5 text-danger">
+          {errorDetail ?? 'Unable to decrypt this image.'}
+        </span>
       </div>
     );
   }
@@ -94,23 +98,29 @@ export const EncryptedImage = ({
   if (loadState !== 'ready' || !objectUrl) {
     return (
       <div
-        className="w-64 max-w-full animate-pulse rounded-xl border border-[#f3c58833] bg-[#241a12]"
         style={{ aspectRatio }}
-      />
+        className="relative flex w-60 max-w-full items-center justify-center overflow-hidden rounded-xl bg-black/20"
+      >
+        <span className="absolute inset-0 animate-sheen bg-white/5" aria-hidden="true" />
+        <Lock className="relative h-5 w-5 text-white/50" aria-hidden="true" />
+        <span className="sr-only">Decrypting photo…</span>
+      </div>
     );
   }
 
   return (
     <button
       type="button"
-      onClick={() => onOpen?.(objectUrl)}
-      className="group block overflow-hidden rounded-xl border border-[#f3c58844] transition-transform hover:scale-[1.01]"
+      onClick={() => onOpen?.(objectUrl, attachment.name)}
+      aria-label={`Open ${attachment.name || 'photo'} full size`}
+      className="group/photo block w-60 max-w-full overflow-hidden rounded-xl"
     >
       <img
         src={objectUrl}
-        alt={attachment.name || 'Encrypted photo'}
+        alt={attachment.name || 'Decrypted photo'}
         style={{ aspectRatio }}
-        className="w-64 max-w-full object-cover"
+        loading="lazy"
+        className="w-full object-cover transition-transform duration-300 group-hover/photo:scale-[1.03]"
       />
     </button>
   );

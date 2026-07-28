@@ -125,6 +125,10 @@ class DemoChatSummary(BaseModel):
     id: UUID
     name: str
     type: str
+    # Rooms and direct threads are listed apart in the sidebar, so the client
+    # needs the distinction without having to count members itself.
+    kind: Literal["room", "direct"] = "direct"
+    member_count: int = 0
     summary: str
     members: list[DemoChatMember]
 

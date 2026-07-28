@@ -1,49 +1,306 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Fraunces:opsz,wght@9..144,600;9..144,700;9..144,800&display=swap');
+@import 'tailwindcss';
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* ==========================================================================
+   WalkerChat design tokens
 
-:root {
-  color: #ffe9ca;
-  background: #090806;
-  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+   Two themes share one token contract. Components only ever reference the
+   semantic names below, never a raw colour, so re-theming is a single-file
+   change. `data-theme` on <html> is set by lib/theme.ts before paint.
+   ========================================================================== */
+
+/* `inline` matters: it makes utilities emit `var(--wc-*)` directly instead of
+   aliasing through `var(--color-*)`. Chromium does not reliably invalidate that
+   second hop when `data-theme` flips, so without it the runtime theme toggle
+   only repaints part of the page. */
+@theme inline {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* Surfaces, back to front. */
+  --color-canvas: var(--wc-canvas);
+  --color-panel: var(--wc-panel);
+  --color-raised: var(--wc-raised);
+  --color-sunken: var(--wc-sunken);
+
+  /* Hairlines. */
+  --color-line: var(--wc-line);
+  --color-line-strong: var(--wc-line-strong);
+
+  /* Text, high to low emphasis. */
+  --color-ink: var(--wc-ink);
+  --color-ink-muted: var(--wc-ink-muted);
+  --color-ink-subtle: var(--wc-ink-subtle);
+
+  /* Brand accent — used for the send action, own-message bubbles, focus. */
+  --color-accent: var(--wc-accent);
+  --color-accent-hover: var(--wc-accent-hover);
+  --color-accent-soft: var(--wc-accent-soft);
+  --color-on-accent: var(--wc-on-accent);
+
+  /* Encryption / presence "all good" signal. Deliberately not the accent, so
+     "this is secure" never reads as "this is a button". */
+  --color-signal: var(--wc-signal);
+  --color-signal-soft: var(--wc-signal-soft);
+
+  --color-danger: var(--wc-danger);
+  --color-danger-soft: var(--wc-danger-soft);
+  --color-warn: var(--wc-warn);
+  --color-warn-soft: var(--wc-warn-soft);
+
+  --radius-field: 0.75rem;
+  --radius-card: 1rem;
+  --radius-panel: 1.25rem;
+
+  --shadow-card: var(--wc-shadow-card);
+  --shadow-pop: var(--wc-shadow-pop);
+  --shadow-glow: var(--wc-shadow-glow);
+
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --animate-rise: rise 0.28s var(--ease-out-soft) both;
+  --animate-fade: fade 0.2s ease-out both;
+  --animate-pop: pop 0.22s var(--ease-out-soft) both;
+  --animate-sheen: sheen 1.6s ease-in-out infinite;
+  --animate-blink: blink 1.4s ease-in-out infinite;
 }
 
-h1,
-h2,
-h3,
-h4,
-h5,
-h6,
-.font-extrabold,
-.font-bold {
-  font-family: "Fraunces", "Space Grotesk", serif;
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --wc-canvas: #0a0b0f;
+  --wc-panel: #101218;
+  --wc-raised: #171a22;
+  --wc-sunken: #0d0e13;
+
+  --wc-line: #23262f;
+  --wc-line-strong: #333744;
+
+  --wc-ink: #f2f3f7;
+  --wc-ink-muted: #a2a7b5;
+  /* 5.1:1 on canvas — timestamps and meta text are 11px, so they still owe
+     WCAG AA for normal text. */
+  --wc-ink-subtle: #7c8194;
+
+  /* 4.8:1 against white bubble text. A lighter indigo reads nicer but drops
+     below 4.5:1, so this is the ceiling. */
+  --wc-accent: #5d5fee;
+  --wc-accent-hover: #7c7ef5;
+  --wc-accent-soft: #5d5fee1f;
+  --wc-on-accent: #ffffff;
+
+  --wc-signal: #34d3a0;
+  --wc-signal-soft: #34d3a01f;
+
+  --wc-danger: #f4707f;
+  --wc-danger-soft: #f4707f1f;
+  --wc-warn: #f0b45f;
+  --wc-warn-soft: #f0b45f1f;
+
+  --wc-shadow-card: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px -12px rgb(0 0 0 / 0.6);
+  --wc-shadow-pop: 0 24px 60px -20px rgb(0 0 0 / 0.75);
+  --wc-shadow-glow: 0 8px 28px -12px rgb(99 102 241 / 0.55);
+
+  --wc-bubble-peer: #191c25;
+  --wc-scrollbar: #2b2f3a;
 }
 
-.font-display {
-  font-family: "Fraunces", "Space Grotesk", serif;
+[data-theme='light'] {
+  color-scheme: light;
+
+  --wc-canvas: #f4f5f8;
+  --wc-panel: #ffffff;
+  --wc-raised: #ffffff;
+  --wc-sunken: #eceef3;
+
+  --wc-line: #e3e5ec;
+  --wc-line-strong: #cdd1dc;
+
+  --wc-ink: #14161c;
+  --wc-ink-muted: #5b6172;
+  /* 4.7:1 on canvas — see the dark-theme note above. */
+  --wc-ink-subtle: #676d7e;
+
+  --wc-accent: #5457e5;
+  --wc-accent-hover: #4245d4;
+  --wc-accent-soft: #5457e514;
+  --wc-on-accent: #ffffff;
+
+  /* Deeper than the dark-theme pair: these carry 11-12px status text on a white
+     panel, so they have to clear 4.5:1 rather than just look green/amber. */
+  --wc-signal: #097654;
+  --wc-signal-soft: #09765414;
+
+  --wc-danger: #d63b52;
+  --wc-danger-soft: #d63b5214;
+  --wc-warn: #94600c;
+  --wc-warn-soft: #94600c14;
+
+  --wc-shadow-card: 0 1px 2px rgb(16 20 35 / 0.06), 0 8px 24px -14px rgb(16 20 35 / 0.18);
+  --wc-shadow-pop: 0 24px 60px -22px rgb(16 20 35 / 0.28);
+  --wc-shadow-glow: 0 8px 28px -14px rgb(84 87 229 / 0.45);
+
+  --wc-bubble-peer: #f0f2f7;
+  --wc-scrollbar: #c8ccd8;
 }
 
-* {
-  box-sizing: border-box;
+/* ==========================================================================
+   Base
+   ========================================================================== */
+
+@layer base {
+  * {
+    border-color: var(--wc-line);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    margin: 0;
+    /* Longhand, not the `background` shorthand: Chromium does not reliably
+       re-resolve a var() inside a shorthand when the theme attribute flips. */
+    background-color: var(--wc-canvas);
+    color: var(--wc-ink);
+    font-family: var(--font-sans);
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    /* The shell owns all scrolling; the page itself never scrolls. */
+    overflow: hidden;
+  }
+
+  /* One consistent focus treatment everywhere, including custom controls. */
+  :focus-visible {
+    outline: 2px solid var(--wc-accent);
+    outline-offset: 2px;
+    border-radius: 0.375rem;
+  }
+
+  ::selection {
+    background: var(--wc-accent);
+    color: var(--wc-on-accent);
+  }
+
+  input,
+  textarea,
+  button {
+    font: inherit;
+    color: inherit;
+  }
 }
 
-html {
-  min-width: 320px;
-  background: #090806;
+/* ==========================================================================
+   Utilities
+   ========================================================================== */
+
+@utility scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--wc-scrollbar) transparent;
+
+  &::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  &::-webkit-scrollbar-thumb {
+    background: var(--wc-scrollbar);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  &::-webkit-scrollbar-thumb:hover {
+    background: var(--wc-line-strong);
+    background-clip: padding-box;
+  }
 }
 
-body {
-  margin: 0;
-  min-width: 320px;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at 15% 5%, rgba(255, 188, 106, 0.2), transparent 35%),
-    radial-gradient(circle at 85% 100%, rgba(109, 228, 183, 0.12), transparent 40%),
-    #090806;
+/* Peer message bubble fill — themed separately from the generic surfaces so
+   the bubble can sit slightly off the panel colour in both themes. */
+@utility bubble-peer {
+  background-color: var(--wc-bubble-peer);
 }
 
-#root {
-  min-height: 100vh;
+/* Faint grid used behind the sign-in art. */
+@utility grid-veil {
+  background-image:
+    linear-gradient(to right, var(--wc-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--wc-line) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 40%, #000 20%, transparent 75%);
+}
+
+/* ==========================================================================
+   Keyframes
+   ========================================================================== */
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes sheen {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

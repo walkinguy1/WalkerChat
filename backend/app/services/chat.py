@@ -258,6 +258,8 @@ async def get_bootstrap_data(session: AsyncSession) -> BootstrapResponse:
                 id=settings.demo_chat_id,
                 name=DEMO_CHAT_NAME,
                 type=ChatType.DIRECT.value,
+                kind="direct",
+                member_count=len(members),
                 summary=DEMO_CHAT_SUMMARY,
                 members=members,
             )
