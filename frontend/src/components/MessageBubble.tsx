@@ -32,7 +32,6 @@ interface MessageBubbleProps {
   endsGroup: boolean;
   apiUrl: string;
   authToken: string | null;
-  sessionAesKey: CryptoKey | null;
   onOpenImage: (objectUrl: string, name: string) => void;
   onReply: (message: DisplayMessage) => void;
   onToggleReaction: (message: DisplayMessage, emoji: string) => void;
@@ -57,7 +56,6 @@ export const MessageBubble = ({
   endsGroup,
   apiUrl,
   authToken,
-  sessionAesKey,
   onOpenImage,
   onReply,
   onToggleReaction,
@@ -188,7 +186,6 @@ export const MessageBubble = ({
               attachment={message.attachment}
               apiUrl={apiUrl}
               authToken={authToken}
-              sessionAesKey={sessionAesKey}
               onOpen={onOpenImage}
             />
           ) : null}

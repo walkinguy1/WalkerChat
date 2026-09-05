@@ -1,4 +1,13 @@
-import { decryptBytes, encryptBytes } from './crypto';
+import {
+  IV_LEN,
+  KEY_LEN,
+  aeadOpen,
+  aeadSeal,
+  fromBase64,
+  randomBytes,
+  toArrayBuffer,
+  toBase64,
+} from './crypto/primitives';
 import { fetchEncryptedMedia, uploadEncryptedMedia } from './api';
 import type { ImageAttachment } from '../types/chat';
 
@@ -100,27 +109,40 @@ export const prepareImage = async (file: File): Promise<PreparedImage> => {
 };
 
 /**
- * Encrypt an image and upload the ciphertext.
+ * Encrypt an image under a fresh key and upload the ciphertext.
  *
- * Returns the attachment descriptor to embed in the (also encrypted) chat
- * message. The IV lives here, not with the stored blob, so the blob alone is
- * unreadable.
+ * The key is generated per attachment and returned in the descriptor, which travels
+ * inside the ratcheted chat message. That is what gives images the same forward
+ * secrecy as text: previously every photo in a conversation was encrypted under one
+ * long-lived session key, so recovering that key exposed all of them at once.
+ *
+ * Neither the key nor the IV is stored with the blob, so object storage holds bytes
+ * that are unreadable on their own.
  */
 export const encryptAndUploadImage = async (
   apiUrl: string,
   chatId: string,
   token: string,
-  aesKey: CryptoKey,
   file: File,
 ): Promise<ImageAttachment> => {
   const prepared = await prepareImage(file);
-  const { ciphertext, ivBase64 } = await encryptBytes(prepared.bytes, aesKey);
-  const uploaded = await uploadEncryptedMedia(apiUrl, chatId, token, ciphertext);
+
+  const contentKey = randomBytes(KEY_LEN);
+  const iv = randomBytes(IV_LEN);
+  const ciphertext = await aeadSeal(
+    contentKey,
+    iv,
+    new Uint8Array(prepared.bytes),
+    new Uint8Array(0),
+  );
+
+  const uploaded = await uploadEncryptedMedia(apiUrl, chatId, token, toArrayBuffer(ciphertext));
 
   return {
     kind: 'image',
     media_id: uploaded.media_id,
-    iv: ivBase64,
+    key: toBase64(contentKey),
+    iv: toBase64(iv),
     mime: prepared.mime,
     name: prepared.name,
     size: prepared.bytes.byteLength,
@@ -138,12 +160,16 @@ export const encryptAndUploadImage = async (
 export const downloadAndDecryptImage = async (
   apiUrl: string,
   token: string,
-  aesKey: CryptoKey,
   attachment: ImageAttachment,
 ): Promise<string> => {
   const ciphertext = await fetchEncryptedMedia(apiUrl, attachment.media_id, token);
-  const plaintext = await decryptBytes(ciphertext, attachment.iv, aesKey);
-  const blob = new Blob([plaintext], { type: attachment.mime });
+  const plaintext = await aeadOpen(
+    fromBase64(attachment.key),
+    fromBase64(attachment.iv),
+    new Uint8Array(ciphertext),
+    new Uint8Array(0),
+  );
+  const blob = new Blob([toArrayBuffer(plaintext)], { type: attachment.mime });
 
   return URL.createObjectURL(blob);
 };

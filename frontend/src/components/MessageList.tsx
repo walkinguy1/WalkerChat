@@ -22,7 +22,6 @@ interface MessageListProps {
   reactionsByMessageId: Map<string, ReactionTally[]>;
   apiUrl: string;
   authToken: string | null;
-  sessionAesKey: CryptoKey | null;
   onOpenImage: (objectUrl: string, name: string) => void;
   onReply: (message: DisplayMessage) => void;
   onToggleReaction: (message: DisplayMessage, emoji: string) => void;
@@ -114,7 +113,6 @@ export const MessageList = ({
   reactionsByMessageId,
   apiUrl,
   authToken,
-  sessionAesKey,
   onOpenImage,
   onReply,
   onToggleReaction,
@@ -239,7 +237,6 @@ export const MessageList = ({
                   endsGroup={row.endsGroup}
                   apiUrl={apiUrl}
                   authToken={authToken}
-                  sessionAesKey={sessionAesKey}
                   onOpenImage={onOpenImage}
                   onReply={onReply}
                   onToggleReaction={onToggleReaction}

@@ -7,7 +7,6 @@ interface EncryptedImageProps {
   attachment: ImageAttachment;
   apiUrl: string;
   authToken: string | null;
-  sessionAesKey: CryptoKey | null;
   onOpen?: (objectUrl: string, name: string) => void;
 }
 
@@ -23,7 +22,6 @@ export const EncryptedImage = ({
   attachment,
   apiUrl,
   authToken,
-  sessionAesKey,
   onOpen,
 }: EncryptedImageProps) => {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -31,7 +29,7 @@ export const EncryptedImage = ({
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!authToken || !sessionAesKey) {
+    if (!authToken) {
       return;
     }
 
@@ -44,8 +42,7 @@ export const EncryptedImage = ({
         const url = await downloadAndDecryptImage(
           apiUrl,
           authToken,
-          sessionAesKey,
-          attachment,
+                  attachment,
         );
         createdUrl = url;
 
@@ -75,7 +72,7 @@ export const EncryptedImage = ({
         URL.revokeObjectURL(createdUrl);
       }
     };
-  }, [apiUrl, attachment, authToken, sessionAesKey]);
+  }, [apiUrl, attachment, authToken]);
 
   // Reserve the final layout size so the bubble does not jump when the image
   // finishes decrypting.
