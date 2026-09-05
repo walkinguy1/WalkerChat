@@ -4,19 +4,21 @@ import {
   fetchBootstrap,
   fetchHistory,
   fetchIceConfig,
-  fetchPrekeyBundle,
+  claimPrekeyBundle,
+  fetchPrekeyCount,
   fetchWsTicket,
   login,
   logout,
-  uploadIdentityKeys,
+  publishKeys,
+  uploadOneTimePreKeys,
 } from './lib/api';
+import { CryptoStore } from './lib/crypto/store';
 import {
-  clearAllSessions,
-  encryptMessage,
-  getOrCreateKeyPair,
-  getOrCreateSession,
-  type KeyBundle,
-} from './lib/crypto';
+  DecryptionFailure,
+  SessionManager,
+  bootstrapIdentity,
+  replenishOneTimePreKeys,
+} from './lib/crypto/session';
 import {
   buildReactionTallies,
   buildReplyRef,
@@ -100,8 +102,8 @@ const App = () => {
   );
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [wsTicket, setWsTicket] = useState<string | null>(null);
-  const [myKeys, setMyKeys] = useState<KeyBundle | null>(null);
-  const [sessionAesKey, setSessionAesKey] = useState<CryptoKey | null>(null);
+  const [sessionManager, setSessionManager] = useState<SessionManager | null>(null);
+  const [cryptoStore, setCryptoStore] = useState<CryptoStore | null>(null);
   const [signingInUsername, setSigningInUsername] = useState<string | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
@@ -113,6 +115,13 @@ const App = () => {
   // Set after useWebRTC initialises, so the socket handler below can reach it
   // without the two hooks depending on each other.
   const handleSignalRef = useRef<((signal: WebRtcSignalEvent) => void) | null>(null);
+  // Same pattern for message decryption: the socket handler is defined above the
+  // session state it needs.
+  const decryptEnvelopeRef = useRef<
+    ((record: ChatMessageEvent | ChatMessageRecord) => Promise<
+      ReturnType<typeof resolveEnvelope> | null
+    >) | null
+  >(null);
 
   const currentUser = useMemo(
     () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
@@ -151,7 +160,10 @@ const App = () => {
 
       if (message.type === 'chat_message') {
         if (message.chat_id === activeChat.id) {
-          void resolveEnvelope(message, sessionAesKey).then((resolved) => {
+          void decryptEnvelopeRef.current?.(message).then((resolved) => {
+            if (!resolved) {
+              return;
+            }
             if (resolved.kind === 'reaction') {
               setReactions((previousReactions) =>
                 mergeReactions(previousReactions, resolved.reaction),
@@ -342,19 +354,65 @@ const App = () => {
   }, [activeChatId, authToken]);
 
   /**
-   * Decrypt whatever history we hold. Re-runs when the key lands, so messages
+   * Decrypt one stored or live envelope.
+   *
+   * A message that does not authenticate becomes a visibly failed bubble. It is never
+   * rendered as text: the previous implementation fell back to reading the payload as
+   * plaintext, which let anyone able to write a message row inject messages that looked
+   * end-to-end encrypted.
+   */
+  const decryptEnvelope = useCallback(
+    async (
+      record: ChatMessageEvent | ChatMessageRecord,
+    ): Promise<ReturnType<typeof resolveEnvelope> | null> => {
+      if (!sessionManager) {
+        return null;
+      }
+
+      try {
+        const plaintext = await sessionManager.decrypt(record.sender_id, record.ciphertext);
+        return resolveEnvelope(record, plaintext);
+      } catch (error) {
+        if (!(error instanceof DecryptionFailure)) {
+          throw error;
+        }
+
+        const clientMessageId =
+          'client_message_id' in record ? record.client_message_id : record.message_id;
+        return {
+          kind: 'message',
+          message: {
+            id: record.message_id ?? clientMessageId,
+            clientMessageId,
+            serverMessageId: record.message_id,
+            senderId: record.sender_id,
+            body: '',
+            sentAt: record.sent_at ?? new Date().toISOString(),
+            state: 'failed',
+          },
+        };
+      }
+    },
+    [sessionManager],
+  );
+
+  useEffect(() => {
+    decryptEnvelopeRef.current = decryptEnvelope;
+  }, [decryptEnvelope]);
+
+  /**
+   * Decrypt whatever history we hold. Re-runs once the session is ready, so messages
    * that first rendered as locked placeholders resolve in place.
    */
   useEffect(() => {
-    if (!historyRecords.length) {
+    if (!historyRecords.length || !sessionManager) {
       return;
     }
 
     let isActive = true;
 
-    void Promise.all(
-      historyRecords.map((record) => resolveEnvelope(record, sessionAesKey)),
-    ).then((resolved) => {
+    void Promise.all(historyRecords.map((record) => decryptEnvelope(record))).then((results) => {
+      const resolved = results.filter((entry) => entry !== null);
       if (!isActive) return;
 
       // Fold through mergeMessages so live messages that arrived while we were
@@ -377,7 +435,7 @@ const App = () => {
     return () => {
       isActive = false;
     };
-  }, [historyRecords, sessionAesKey]);
+  }, [decryptEnvelope, historyRecords, sessionManager]);
 
   /**
    * Feed decrypted plaintext into the local search index.
@@ -392,44 +450,40 @@ const App = () => {
     indexChatMessages(activeChatId, messages);
   }, [activeChatId, messages]);
 
-  /** Establish the shared AES key for the open thread. */
+  /**
+   * Keep the published one-time prekey pool topped up.
+   *
+   * Each inbound handshake consumes one. If the pool empties, X3DH still works but
+   * drops its DH4 term, so the first message of a new conversation loses some of its
+   * forward secrecy until the ratchet turns.
+   */
   useEffect(() => {
-    if (!peer || !myKeys || !authToken) {
+    if (!authToken || !cryptoStore) {
       return;
     }
 
     let isActive = true;
 
-    const establishSession = async () => {
+    void (async () => {
       try {
-        const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
-        const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
-        if (preferredPeerKey === 'pending-client-upload') {
-          throw new Error('This peer has not uploaded their keys yet.');
+        const count = await fetchPrekeyCount(apiUrl, authToken);
+        if (!isActive || !count.should_replenish) {
+          return;
         }
-        const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
+        const preKeys = await replenishOneTimePreKeys(cryptoStore);
         if (isActive) {
-          setSessionAesKey(session.sharedKey);
+          await uploadOneTimePreKeys(apiUrl, authToken, preKeys);
         }
       } catch (error) {
-        console.error('Failed to establish secure session.', error);
-        if (isActive) {
-          setSessionAesKey(null);
-          pushToast(
-            error instanceof Error
-              ? error.message
-              : 'Unable to establish a secure session for this chat.',
-          );
-        }
+        // Not fatal: the handshake degrades rather than failing outright.
+        console.warn('Unable to replenish one-time prekeys.', error);
       }
-    };
-
-    void establishSession();
+    })();
 
     return () => {
       isActive = false;
     };
-  }, [authToken, myKeys, peer]);
+  }, [authToken, cryptoStore]);
 
   /** Broadcast typing state, debounced back to idle after a pause. */
   useEffect(() => {
@@ -508,20 +562,39 @@ const App = () => {
         }
       }
 
-      clearAllSessions();
-      setSessionAesKey(null);
+      cryptoStore?.close();
+      setSessionManager(null);
+      setCryptoStore(null);
       setWsTicket(null);
 
       const tokenData = await login(apiUrl, account.username, account.password);
-      const keys = await getOrCreateKeyPair(account.username);
-      await uploadIdentityKeys(
-        apiUrl,
-        tokenData.access_token,
-        keys.publicKeyBase64,
-        keys.publicKeyBase64,
+
+      // The account password unlocks the local key vault. Private keys are sealed at
+      // rest, so signing in is what makes them readable again.
+      const store = await CryptoStore.unlock(account.password, {
+        databaseName: `walkerchat-crypto-${account.username}`,
+      });
+
+      const bootstrapped = await bootstrapIdentity(store);
+      if (bootstrapped.publish) {
+        await publishKeys(apiUrl, tokenData.access_token, bootstrapped.publish);
+      }
+
+      setCryptoStore(store);
+      setSessionManager(
+        new SessionManager({
+          store,
+          identity: bootstrapped.identity,
+          fetchBundle: (peerId) => claimPrekeyBundle(apiUrl, peerId, tokenData.access_token),
+          onIdentityChange: ({ peerId }) => {
+            // The only defence against a server swapping keys is telling the user.
+            pushToast(
+              `Security code for ${peerId} changed. Verify their safety number before trusting this chat.`,
+            );
+          },
+        }),
       );
 
-      setMyKeys(keys);
       setAuthToken(tokenData.access_token);
       setSelectedUserId(tokenData.user_id);
       setDraft('');
@@ -542,14 +615,16 @@ const App = () => {
     } catch (error) {
       console.error('Logout failed.', error);
     } finally {
-      clearAllSessions();
+      // Locking drops the vault key from memory; the sealed data stays on disk so the
+      // conversation survives the next sign-in.
+      cryptoStore?.close();
       clearToasts();
       // Decrypted plaintext must not outlive the session it belongs to.
       clearSearchIndex();
       setAuthToken(null);
       setWsTicket(null);
-      setMyKeys(null);
-      setSessionAesKey(null);
+      setSessionManager(null);
+      setCryptoStore(null);
       setSelectedUserId(null);
       setActiveChatId(null);
       setBootstrap(null);
@@ -567,35 +642,24 @@ const App = () => {
   };
 
   /**
-   * Return the chat's AES key, establishing the session on demand.
+   * Encrypt a plaintext for the open thread.
    *
-   * Both text and photo sends need this, and either can run before the
-   * background key exchange effect has finished.
+   * The session layer establishes the X3DH session on first use and ratchets from then
+   * on, so callers no longer hold a key at all.
    */
-  const ensureSessionKey = async (): Promise<CryptoKey | null> => {
-    if (sessionAesKey) {
-      return sessionAesKey;
-    }
-
-    if (!peer || !myKeys || !authToken) {
-      pushToast('The secure session is not ready yet. Wait for the key exchange to finish.');
+  const encryptForPeer = async (plaintext: string): Promise<string | null> => {
+    if (!sessionManager || !peer) {
+      pushToast('The secure session is not ready yet.');
       return null;
     }
 
     try {
-      const bundle = await fetchPrekeyBundle(apiUrl, peer.user_id, authToken);
-      const preferredPeerKey = bundle.one_time_prekey ?? bundle.signed_prekey_pub;
-      if (preferredPeerKey === 'pending-client-upload') {
-        throw new Error('This peer has not uploaded their keys yet.');
-      }
-      const session = await getOrCreateSession(peer.user_id, preferredPeerKey, myKeys);
-      setSessionAesKey(session.sharedKey);
-      return session.sharedKey;
+      return await sessionManager.encrypt(peer.user_id, plaintext);
     } catch (error) {
       pushToast(
         error instanceof Error
           ? error.message
-          : 'The secure session could not be established. Make sure the peer is active.',
+          : 'The secure session could not be established for this chat.',
       );
       return null;
     }
@@ -603,7 +667,6 @@ const App = () => {
 
   /** Encrypt, send, and optimistically render one message. */
   const sendEncryptedMessage = async (
-    aesKey: CryptoKey,
     caption: string,
     attachment?: ImageAttachment,
     replyRef?: ReplyRef,
@@ -612,10 +675,12 @@ const App = () => {
       return false;
     }
 
-    const ciphertext = await encryptMessage(
+    const ciphertext = await encryptForPeer(
       encodeMessagePayload(caption, attachment, replyRef),
-      aesKey,
     );
+    if (!ciphertext) {
+      return false;
+    }
 
     const outboundMessage: ChatMessageEvent = {
       type: 'chat_message',
@@ -625,11 +690,6 @@ const App = () => {
       target_id: peer.user_id,
       ciphertext,
       is_media: Boolean(attachment),
-      encryption: {
-        algorithm: 'aes-256-gcm',
-        version: 1,
-        key_id: `${currentUser.username}-primary-device`,
-      },
       sent_at: new Date().toISOString(),
     };
 
@@ -662,14 +722,9 @@ const App = () => {
       return;
     }
 
-    const activeAesKey = await ensureSessionKey();
-    if (!activeAesKey) {
-      return;
-    }
-
     try {
       const replyRef = replyTo ? buildReplyRef(replyTo) : undefined;
-      if (await sendEncryptedMessage(activeAesKey, trimmedDraft, undefined, replyRef)) {
+      if (await sendEncryptedMessage(trimmedDraft, undefined, replyRef)) {
         setDraft('');
         setReplyTo(null);
       }
@@ -696,16 +751,11 @@ const App = () => {
     );
     const action = alreadyMine ? 'remove' : 'add';
 
-    const activeAesKey = await ensureSessionKey();
-    if (!activeAesKey) {
-      return;
-    }
-
     try {
-      const ciphertext = await encryptMessage(
-        encodeReactionPayload(message.id, emoji, action),
-        activeAesKey,
-      );
+      const ciphertext = await encryptForPeer(encodeReactionPayload(message.id, emoji, action));
+      if (!ciphertext) {
+        return;
+      }
 
       const clientMessageId = crypto.randomUUID();
       const sentAt = new Date().toISOString();
@@ -718,11 +768,6 @@ const App = () => {
         target_id: peer.user_id,
         ciphertext,
         is_media: false,
-        encryption: {
-          algorithm: 'aes-256-gcm',
-          version: 1,
-          key_id: `${currentUser.username}-primary-device`,
-        },
         sent_at: sentAt,
       } satisfies ChatMessageEvent);
 
@@ -759,23 +804,19 @@ const App = () => {
       return;
     }
 
-    const activeAesKey = await ensureSessionKey();
-    if (!activeAesKey) {
+    if (!sessionManager) {
+      pushToast('The secure session is not ready yet.');
       return;
     }
 
     setIsUploadingPhoto(true);
 
     try {
-      const attachment = await encryptAndUploadImage(
-        apiUrl,
-        activeChat.id,
-        authToken,
-        activeAesKey,
-        file,
-      );
+      // The image gets its own random content key; the descriptor carrying it is then
+      // sent inside the ratcheted message below.
+      const attachment = await encryptAndUploadImage(apiUrl, activeChat.id, authToken, file);
 
-      if (await sendEncryptedMessage(activeAesKey, draft.trim(), attachment)) {
+      if (await sendEncryptedMessage(draft.trim(), attachment)) {
         setDraft('');
       }
     } catch (error) {
@@ -931,7 +972,7 @@ const App = () => {
           peer={peer}
           peerPresence={peerPresence}
           connectionState={connectionState}
-          isSecure={Boolean(sessionAesKey)}
+          isSecure={Boolean(sessionManager)}
           isPeerTyping={typingUserId === peer?.user_id}
           canCall={Boolean(peer) && !call.isCallActive && isSocketOpen}
           onlineCount={onlineMemberCount}
@@ -948,7 +989,6 @@ const App = () => {
           reactionsByMessageId={reactionsByMessageId}
           apiUrl={apiUrl}
           authToken={authToken}
-          sessionAesKey={sessionAesKey}
           onOpenImage={(url, name) => setLightboxImage({ url, name })}
           onReply={setReplyTo}
           onToggleReaction={(message, emoji) => void handleToggleReaction(message, emoji)}
@@ -959,7 +999,7 @@ const App = () => {
           onDraftChange={setDraft}
           onSend={() => void handleSend()}
           onSendPhoto={(file) => void handleSendPhoto(file)}
-          isSecure={Boolean(sessionAesKey)}
+          isSecure={Boolean(sessionManager)}
           isUploading={isUploadingPhoto}
           isSocketOpen={isSocketOpen}
           peerName={peer?.display_name ?? activeChat.name}
