@@ -2,7 +2,16 @@ import enum
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Enum as SQLEnum, ForeignKey, String, Text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Enum as SQLEnum,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 
 from .base import Base
@@ -36,14 +45,32 @@ class ChatMember(Base):
 
 
 class Message(Base):
+    """
+    A stored message.
+
+    `encrypted_payload` is fully opaque: it carries the message type, the ratchet
+    header, and the ciphertext as one sealed blob. The ratchet header is deliberately
+    *not* broken out into queryable columns -- doing so would publish the sender's
+    ratchet key and message counters to the server for no operational benefit.
+    """
+
     __tablename__ = "messages"
+    __table_args__ = (
+        # Idempotency. Without this a WebSocket reconnect mid-send writes the row
+        # twice, and the receiving ratchet sees the duplicate as a replay.
+        UniqueConstraint("chat_id", "client_message_id", name="uq_messages_chat_client_id"),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     chat_id = Column(UUID(as_uuid=True), ForeignKey("chats.id"))
     sender_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
 
+    client_message_id = Column(String, nullable=False)
+
     encrypted_payload = Column(Text, nullable=False)
     is_media = Column(Boolean, default=False)
 
     status = Column(SQLEnum(MessageStatus), default=MessageStatus.SENT)
+    # Server-assigned receive time. The client's own timestamp is advisory only: a
+    # skewed or malicious clock must not be able to reorder history.
     sent_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))
