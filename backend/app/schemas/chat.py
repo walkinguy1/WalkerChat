@@ -5,14 +5,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 
-class EncryptionMetadata(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    algorithm: str = "aes-256-gcm"
-    version: int = 1
-    key_id: str = "local-device"
-
-
 class ChatMessageEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -24,7 +16,6 @@ class ChatMessageEvent(BaseModel):
     target_id: UUID
     ciphertext: str = Field(min_length=1)
     is_media: bool = False
-    encryption: EncryptionMetadata = Field(default_factory=EncryptionMetadata)
     sent_at: datetime | None = None
 
 
@@ -98,7 +89,9 @@ class ChatMessageRecord(BaseModel):
     status: str
     is_media: bool
     sent_at: datetime
-    encryption: EncryptionMetadata = Field(default_factory=EncryptionMetadata)
+    # Echoed back so the client can reconcile its optimistic copy across a reload,
+    # not just within the lifetime of one page.
+    client_message_id: UUID
 
 
 class ChatHistoryResponse(BaseModel):

@@ -59,11 +59,11 @@ async def register(
             detail="Username already taken.",
         )
 
+    # Key material is generated in the browser and published separately via
+    # POST /api/keys/publish, so a new account genuinely has no keys yet.
     user = User(
         username=body.username,
         password_hash=hash_password(body.password),
-        identity_key_pub="pending-client-upload",
-        signed_prekey_pub="pending-client-upload",
     )
     session.add(user)
     await session.commit()

@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -65,8 +66,6 @@ async def seed_demo_data(session: AsyncSession) -> None:
                 id=settings.demo_alice_id,
                 username="alice",
                 password_hash=hash_password(DEMO_PASSWORD),
-                identity_key_pub="pending-client-upload",
-                signed_prekey_pub="pending-client-upload",
             )
         )
 
@@ -76,8 +75,6 @@ async def seed_demo_data(session: AsyncSession) -> None:
                 id=settings.demo_bob_id,
                 username="bob",
                 password_hash=hash_password(DEMO_PASSWORD),
-                identity_key_pub="pending-client-upload",
-                signed_prekey_pub="pending-client-upload",
             )
         )
 
@@ -125,6 +122,19 @@ async def ensure_chat_delivery_allowed(
         raise PermissionError("Target user is not a member of this chat.")
 
 
+def _to_record(message: Message) -> ChatMessageRecord:
+    return ChatMessageRecord(
+        message_id=message.id,
+        chat_id=message.chat_id,
+        sender_id=message.sender_id,
+        ciphertext=message.encrypted_payload,
+        status=message.status.value,
+        is_media=message.is_media,
+        sent_at=message.sent_at,
+        client_message_id=message.client_message_id,
+    )
+
+
 async def persist_chat_message(
     session: AsyncSession, event: ChatMessageEvent
 ) -> ChatMessageRecord:
@@ -138,23 +148,34 @@ async def persist_chat_message(
     message = Message(
         chat_id=event.chat_id,
         sender_id=event.sender_id,
+        client_message_id=str(event.client_message_id),
         encrypted_payload=event.ciphertext,
         is_media=event.is_media,
-        sent_at=_to_naive_utc(event.sent_at or _naive_utc_now()),
+        # Server-stamped. The client's own clock is not trusted for ordering: a skewed
+        # or hostile clock could otherwise insert messages anywhere in history.
+        sent_at=_naive_utc_now(),
     )
     session.add(message)
-    await session.commit()
-    await session.refresh(message)
 
-    return ChatMessageRecord(
-        message_id=message.id,
-        chat_id=message.chat_id,
-        sender_id=message.sender_id,
-        ciphertext=message.encrypted_payload,
-        status=message.status.value,
-        is_media=message.is_media,
-        sent_at=message.sent_at,
-    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # A resend of a message we already stored, typically after a socket reconnect
+        # dropped the acknowledgement. Return the original row rather than writing a
+        # duplicate, which the recipient's ratchet would reject as a replay.
+        await session.rollback()
+        existing = await session.scalar(
+            select(Message).where(
+                Message.chat_id == event.chat_id,
+                Message.client_message_id == str(event.client_message_id),
+            )
+        )
+        if existing is None:
+            raise
+        return _to_record(existing)
+
+    await session.refresh(message)
+    return _to_record(message)
 
 
 async def get_recent_messages(
@@ -173,18 +194,7 @@ async def get_recent_messages(
         .all()
     )
 
-    return [
-        ChatMessageRecord(
-            message_id=message.id,
-            chat_id=message.chat_id,
-            sender_id=message.sender_id,
-            ciphertext=message.encrypted_payload,
-            status=message.status.value,
-            is_media=message.is_media,
-            sent_at=message.sent_at,
-        )
-        for message in reversed(rows)
-    ]
+    return [_to_record(message) for message in reversed(rows)]
 
 
 async def validate_typing_event(session: AsyncSession, event: TypingEvent) -> None:
