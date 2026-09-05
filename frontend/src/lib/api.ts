@@ -1,4 +1,5 @@
 import type { BootstrapResponse, ChatHistoryResponse } from '../types/chat';
+import type { EncodedPreKeyBundle, PublishablePreKeys } from './crypto/session';
 
 type TokenResponse = {
   access_token: string;
@@ -93,26 +94,27 @@ export const fetchHistory = async (
   return (await response.json()) as ChatHistoryResponse;
 };
 
-export type PrekeyBundle = {
-  user_id: string;
-  identity_key_pub: string;
-  signed_prekey_pub: string;
-  one_time_prekey: string | null;
-  one_time_prekey_id: string | null;
-};
-
-export const fetchPrekeyBundle = async (
+/**
+ * Claim a prekey bundle.
+ *
+ * This is a POST because it consumes one of the target's one-time prekeys. It used to
+ * be a GET that mutated state, so any prefetch or retry silently burned prekeys.
+ */
+export const claimPrekeyBundle = async (
   apiUrl: string,
   targetUserId: string,
   token: string,
-): Promise<PrekeyBundle> => {
+): Promise<EncodedPreKeyBundle> => {
   const response = await fetch(`${apiUrl}/api/keys/${targetUserId}/bundle`, {
+    method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
-    throw new Error(await readErrorMessage(response, `Prekey bundle request failed with status ${response.status}`));
+    throw new Error(
+      await readErrorMessage(response, `Prekey bundle request failed with status ${response.status}`),
+    );
   }
-  return (await response.json()) as PrekeyBundle;
+  return (await response.json()) as EncodedPreKeyBundle;
 };
 
 export type MediaUploadResponse = {
@@ -193,27 +195,87 @@ export const fetchIceConfig = async (
   }));
 };
 
-export const uploadIdentityKeys = async (
+/** Publish identity key, signed prekey and an initial batch of one-time prekeys. */
+export const publishKeys = async (
   apiUrl: string,
   token: string,
-  identityKeyPub: string,
-  signedPrekeyPub: string,
-): Promise<void> => {
-  const response = await fetch(`${apiUrl}/api/keys/identity`, {
-    method: 'PUT',
+  keys: PublishablePreKeys,
+): Promise<{ identity_changed: boolean; one_time_prekeys_stored: number }> => {
+  const response = await fetch(`${apiUrl}/api/keys/publish`, {
+    method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
-      identity_key_pub: identityKeyPub,
-      signed_prekey_pub: signedPrekeyPub,
+      identity_key: keys.identityKey,
+      signed_prekey: {
+        key_id: keys.signedPreKey.keyId,
+        public_key: keys.signedPreKey.publicKey,
+        signature: keys.signedPreKey.signature,
+      },
+      one_time_prekeys: keys.oneTimePreKeys.map((preKey) => ({
+        key_id: preKey.keyId,
+        public_key: preKey.publicKey,
+      })),
     }),
   });
 
   if (!response.ok) {
     throw new Error(
-      await readErrorMessage(response, `Identity key upload failed with status ${response.status}`),
+      await readErrorMessage(response, `Key publication failed with status ${response.status}`),
+    );
+  }
+
+  return (await response.json()) as { identity_changed: boolean; one_time_prekeys_stored: number };
+};
+
+export type PrekeyCount = {
+  remaining: number;
+  low_water: number;
+  should_replenish: boolean;
+};
+
+/** How many one-time prekeys the server still holds for us. */
+export const fetchPrekeyCount = async (apiUrl: string, token: string): Promise<PrekeyCount> => {
+  const response = await fetch(`${apiUrl}/api/keys/opks/count`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Prekey count failed with status ${response.status}`),
+    );
+  }
+  return (await response.json()) as PrekeyCount;
+};
+
+/** Top up the one-time prekey pool before it runs dry. */
+export const uploadOneTimePreKeys = async (
+  apiUrl: string,
+  token: string,
+  preKeys: { keyId: string; publicKey: string }[],
+): Promise<void> => {
+  if (preKeys.length === 0) {
+    return;
+  }
+
+  const response = await fetch(`${apiUrl}/api/keys/opks`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      prekeys: preKeys.map((preKey) => ({
+        key_id: preKey.keyId,
+        public_key: preKey.publicKey,
+      })),
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Prekey upload failed with status ${response.status}`),
     );
   }
 };
