@@ -1,4 +1,3 @@
-import { decryptMessage } from './crypto';
 import type {
   ChatMessageEvent,
   ChatMessageRecord,
@@ -141,21 +140,40 @@ export const createOptimisticDisplayMessage = (
 });
 
 /**
- * Decrypt one envelope. Reactions and messages share the ciphertext path, so
- * which of the two arrived is only knowable after decryption.
+ * Sort key for a message.
+ *
+ * Timestamps arrive in two shapes -- naive UTC from the server ("...T10:00:00") and
+ * `toISOString()` locally ("...T10:00:00.000Z") -- and comparing those as strings gives
+ * the wrong order. Parsing to an instant is the only thing that works across both.
+ * A value we cannot parse sorts last rather than throwing.
  */
-export const resolveEnvelope = async (
+export const compareSentAt = (left: string, right: string): number => {
+  const leftTime = Date.parse(left.endsWith('Z') ? left : left + 'Z');
+  const rightTime = Date.parse(right.endsWith('Z') ? right : right + 'Z');
+
+  if (Number.isNaN(leftTime) && Number.isNaN(rightTime)) return 0;
+  if (Number.isNaN(leftTime)) return 1;
+  if (Number.isNaN(rightTime)) return -1;
+  return leftTime - rightTime;
+};
+
+/**
+ * Split one decrypted envelope into a message or a reaction.
+ *
+ * Decryption happens in the session layer, so this stays pure: it never sees key
+ * material, and a payload that failed to authenticate never reaches it at all.
+ */
+export const resolveEnvelope = (
   message: ChatMessageEvent | ChatMessageRecord,
-  aesKey?: CryptoKey | null,
-): Promise<
-  { kind: 'message'; message: DisplayMessage } | { kind: 'reaction'; reaction: ReactionEvent }
-> => {
-  const decrypted = await decryptMessage(message.ciphertext, aesKey);
-  const payload = decodeMessagePayload(decrypted.body);
+  plaintext: string,
+):
+  | { kind: 'message'; message: DisplayMessage }
+  | { kind: 'reaction'; reaction: ReactionEvent } => {
+  const payload = decodeMessagePayload(plaintext);
   const clientMessageId =
     'client_message_id' in message ? message.client_message_id : message.message_id;
   const serverMessageId = message.message_id;
-  const sentAt = message.sent_at ?? decrypted.createdAt;
+  const sentAt = message.sent_at ?? new Date().toISOString();
 
   if (payload.kind === 'reaction') {
     return {
@@ -209,7 +227,7 @@ export const buildReactionTallies = (
   const byMessage = new Map<string, Map<string, Set<string>>>();
 
   [...reactions]
-    .sort((left, right) => left.sentAt.localeCompare(right.sentAt))
+    .sort((left, right) => compareSentAt(left.sentAt, right.sentAt))
     .forEach((reaction) => {
       let emojis = byMessage.get(reaction.targetMessageId);
       if (!emojis) {
@@ -248,15 +266,22 @@ export const mergeMessages = (
   previousMessages: DisplayMessage[],
   incomingMessage: DisplayMessage,
 ) => {
-  const existingIndex = previousMessages.findIndex(
-    (message) =>
-      message.serverMessageId === incomingMessage.serverMessageId ||
-      message.clientMessageId === incomingMessage.clientMessageId,
-  );
+  // Match on the server id only when both sides actually have one. Comparing two
+  // `undefined` server ids made any second still-pending send collapse onto the first,
+  // so firing two messages before the first was acknowledged made one disappear.
+  const existingIndex = previousMessages.findIndex((message) => {
+    if (message.serverMessageId && incomingMessage.serverMessageId) {
+      return message.serverMessageId === incomingMessage.serverMessageId;
+    }
+    return (
+      Boolean(message.clientMessageId) &&
+      message.clientMessageId === incomingMessage.clientMessageId
+    );
+  });
 
   if (existingIndex === -1) {
     return [...previousMessages, incomingMessage].sort((left, right) =>
-      left.sentAt.localeCompare(right.sentAt),
+      compareSentAt(left.sentAt, right.sentAt),
     );
   }
 
