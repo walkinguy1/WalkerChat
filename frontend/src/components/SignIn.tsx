@@ -85,8 +85,8 @@ export const SignIn = ({ accounts, pendingUsername, isSigningIn, onSignIn }: Sig
       </div>
 
       <p className="relative flex items-center gap-2 text-xs text-ink-subtle">
-        <span className="h-1.5 w-1.5 rounded-full bg-warn" />
-        Demo build — the crypto path is experimental, not a Signal Protocol implementation.
+        <span className="h-1.5 w-1.5 rounded-full bg-signal" />
+        End-to-end encrypted with X3DH and the Double Ratchet.
       </p>
     </section>
 

@@ -13,7 +13,7 @@ Before your first push:
 3. Review `.gitignore` and confirm `node_modules`, local env files, logs, caches, and service data are not being committed.
 
 ## Features
-- Experimental client-side key exchange and AES-GCM message envelopes
+- End-to-end encryption: X3DH key agreement and the Double Ratchet, implemented against the published Signal specifications
 - Persistent WebSockets using Redis Pub/Sub
 - Encrypted Media Uploads to MinIO (S3-compatible)
 - WebRTC Peer-to-Peer AV signaling
@@ -21,9 +21,24 @@ Before your first push:
 
 ## Security Status
 
-- Message bodies are stored as ciphertext, not plaintext.
-- The current client crypto path is still an experimental demo and is not a full Signal Protocol implementation.
-- Do not market or ship this as production-grade Signal-style E2EE until Double Ratchet, proper session lifecycle, and key management are actually implemented.
+- Message bodies are stored as ciphertext, not plaintext, and a payload that fails
+  authentication is never rendered as text.
+- X3DH and the Double Ratchet are implemented per the published specifications, giving
+  forward secrecy and post-compromise security. See [docs/CRYPTO.md](docs/CRYPTO.md) for
+  the parameters and two documented deviations.
+- Private keys are sealed at rest under a password-derived key; the server only ever
+  holds public key material and ciphertext.
+- Signed prekeys are verified client-side before any key agreement, and identity-key
+  changes surface as a safety-number warning.
+
+Still outstanding before this would be production-grade:
+
+- Group chat and multi-device are not implemented (`ChatType.GROUP` is unused).
+- Ratchet headers are not encrypted, so the server sees message counters. Metadata --
+  who talks to whom, when, and how often -- is not protected.
+- The default JWT and object-storage secrets in `.env.example` are placeholders, the
+  seeded demo accounts use a fixed password, and the `/test/*` debug routes are still
+  mounted without authentication.
 
 ## Directory Structure
 - `/backend`: FastAPI (Async), SQLAlchemy, Alembic, Celery.
