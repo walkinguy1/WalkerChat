@@ -1,9 +1,3 @@
-export type EncryptionMetadata = {
-  algorithm: string;
-  version: number;
-  key_id: string;
-};
-
 export type ChatMessageEvent = {
   type: 'chat_message';
   chat_id: string;
@@ -13,7 +7,6 @@ export type ChatMessageEvent = {
   target_id: string;
   ciphertext: string;
   is_media?: boolean;
-  encryption: EncryptionMetadata;
   sent_at?: string;
 };
 
@@ -25,6 +18,13 @@ export type ChatMessageEvent = {
 export type ImageAttachment = {
   kind: 'image';
   media_id: string;
+  /**
+   * Per-attachment content key, base64. Each image gets its own random key rather
+   * than reusing a long-lived session key, so attachments inherit the ratchet's
+   * forward secrecy: this descriptor travels inside the ratcheted message, so the
+   * key is only readable by someone who could read that message.
+   */
+  key: string;
   iv: string;
   mime: string;
   name: string;
@@ -97,7 +97,6 @@ export type ChatMessageRecord = {
   status: string;
   is_media: boolean;
   sent_at: string;
-  encryption: EncryptionMetadata;
 };
 
 export type TypingEvent = {
@@ -163,7 +162,7 @@ export type DisplayMessage = {
   attachment?: ImageAttachment;
   replyTo?: ReplyRef;
   sentAt: string;
-  state: 'sending' | 'sent';
+  state: 'sending' | 'sent' | 'failed';
 };
 
 export type BootstrapUser = {
