@@ -77,6 +77,18 @@ export const constantTimeEqual = (left: Uint8Array, right: Uint8Array): boolean 
 export const randomBytes = (length: number): Uint8Array =>
   crypto.getRandomValues(new Uint8Array(length));
 
+/**
+ * Copy into a standalone ArrayBuffer.
+ *
+ * Blob and fetch want an ArrayBuffer, and a Uint8Array view may be a window onto a
+ * larger buffer, so handing over `.buffer` directly can leak neighbouring bytes.
+ */
+export const toArrayBuffer = (bytes: Uint8Array): ArrayBuffer =>
+  bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+
 /** Best-effort wipe of key material once it is no longer needed. */
 export const wipe = (bytes: Uint8Array): void => {
   bytes.fill(0);
