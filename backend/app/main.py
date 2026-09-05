@@ -17,7 +17,7 @@ from app.api.test import router as test_router
 from app.api.ws import router as ws_router
 from app.api.webrtc import router as webrtc_router
 from app.core.config import get_settings
-from app.core.database import SessionLocal, init_database
+from app.core.database import SessionLocal, verify_database_schema
 from app.core.runtime_state import close_runtime_redis
 from app.core.storage import ensure_media_bucket
 from app.core.ws_manager import manager
@@ -31,7 +31,7 @@ setup_logging()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    await init_database()
+    await verify_database_schema()
 
     async with SessionLocal() as session:
         await seed_demo_data(session)
