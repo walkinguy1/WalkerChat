@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     auth_rate_limit_attempts: int = 10
     auth_rate_limit_window_seconds: int = 60
 
+    # Prekey bundle claims. Each claim consumes one of the target's one-time prekeys,
+    # so an unlimited rate lets any authenticated user drain another user's pool.
+    key_claim_rate_limit_attempts: int = 30
+    key_claim_rate_limit_window_seconds: int = 60
+    # Clients top up when their published count drops below this.
+    one_time_prekey_low_water: int = 20
+    one_time_prekey_max_stored: int = 200
+
     # Encrypted media storage (MinIO / S3-compatible)
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
