@@ -126,6 +126,44 @@ AEAD AD       := AD_x3dh (64 bytes) || header (40 bytes)
 A prekey message repeats the X3DH fields on every send until the peer replies. Until
 that reply arrives the initiator has no evidence the handshake was ever received.
 
+## Key storage
+
+Implemented in `frontend/src/lib/crypto/store.ts`, backed by IndexedDB.
+
+A master key is derived from the account password with **PBKDF2-SHA256, 600,000
+iterations** (OWASP's current floor) over a per-vault random 16-byte salt. The salt and
+iteration count are stored in the clear; a sealed known plaintext acts as a verifier so
+a wrong password fails immediately with a clear error rather than surfacing later as an
+opaque decryption failure inside the ratchet.
+
+Everything sensitive is sealed under that master key with AES-256-GCM and a random IV:
+
+| Store | Sealed | In the clear |
+|---|---|---|
+| `identity` | private identity key | public key |
+| `signedPreKeys` | private prekey | public key, signature, id, createdAt |
+| `oneTimePreKeys` | private prekey | public key, id |
+| `sessions` | full ratchet state | peer id |
+| `peers` | — | peer identity key, trust flag, timestamps |
+
+Ratchet state is sealed as well as the identity key, not instead of it: it holds the
+root key and chain keys, which read the current conversation just as effectively.
+
+Three properties worth calling out:
+
+- **Sessions are keyed by `(peerId, peerIdentityKey)`**, not by peer alone. Keying by
+  peer alone means a re-registered peer keeps a stale session that produces ciphertext
+  nobody can read.
+- **Rotated signed prekeys are retained** (pruned to the newest N), because a message
+  sent against the previous prekey may still be in flight.
+- **A changed peer identity key resets that peer's trust flag.** The earlier
+  verification was of a different key and cannot carry over.
+
+One implementation constraint, since it is easy to reintroduce: an IndexedDB transaction
+commits as soon as the microtask queue drains without new requests, so awaiting a
+WebCrypto promise inside one silently closes it. Every method seals or opens *before*
+opening its transaction.
+
 ## Safety numbers
 
 60 decimal digits, following Signal's numeric fingerprint construction: 5200 iterations
