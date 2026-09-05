@@ -126,6 +126,47 @@ AEAD AD       := AD_x3dh (64 bytes) || header (40 bytes)
 A prekey message repeats the X3DH fields on every send until the peer replies. Until
 that reply arrives the initiator has no evidence the handshake was ever received.
 
+## Key distribution
+
+The server is a key *directory*, not a trust anchor. It cannot be relied on to be honest
+about the material it serves, which is why the client verifies the signed prekey
+signature itself and surfaces identity changes through safety numbers.
+
+For that reason the server deliberately does **not** verify XEdDSA signatures. Doing so
+would catch buggy clients but protect nothing against a malicious server, and the client
+must verify regardless. What the server does instead is refuse structurally impossible
+material and make identity changes visible.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/keys/publish` | Publish identity key, signed prekey and an initial OPK batch |
+| `POST /api/keys/signed-prekey` | Rotate the signed prekey |
+| `POST /api/keys/opks` | Top up the one-time prekey pool |
+| `GET /api/keys/opks/count` | Remaining OPKs, with a replenish hint |
+| `POST /api/keys/{user_id}/bundle` | Claim a prekey bundle (consumes one OPK) |
+
+Four changes from the previous design, each fixing a specific defect:
+
+- **Claiming is a POST, not a GET.** It consumes a one-time prekey, so as a GET any
+  prefetch, retry or crawler silently burned prekeys.
+- **The claim is atomic**: a single `DELETE ... RETURNING` over a `FOR UPDATE SKIP
+  LOCKED` subquery. The previous select-then-update was a race in which two concurrent
+  initiators could be handed the *same* one-time prekey, destroying the forward secrecy
+  it exists to provide. Claimed prekeys are deleted rather than flagged, so consumed
+  rows cannot accumulate forever.
+- **Claims are rate limited per requester.** Each call permanently removes one of the
+  target's prekeys, so an unlimited rate lets any authenticated user drain another
+  user's pool and force every later handshake onto the weaker no-OPK path.
+- **Key material is validated as base64 of exactly the right length** (32 bytes for
+  keys, 64 for signatures). The old check accepted any non-blank string of 16 to 4096
+  characters, which is how the literal sentinel `"pending-client-upload"` came to live
+  in a `NOT NULL` public-key column. Accounts now start with genuinely null keys and
+  publish them after registration.
+
+Running out of one-time prekeys is expected and does not block a handshake: X3DH simply
+omits the `DH4` term. Clients replenish against `GET /api/keys/opks/count` well before
+the pool empties.
+
 ## Key storage
 
 Implemented in `frontend/src/lib/crypto/store.ts`, backed by IndexedDB.
