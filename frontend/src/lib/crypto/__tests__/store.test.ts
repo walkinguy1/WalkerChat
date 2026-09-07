@@ -331,6 +331,67 @@ describe('peer identity tracking', () => {
   });
 });
 
+describe('the outgoing message log', () => {
+  it('round-trips our own sent plaintext', async () => {
+    const store = await unlock();
+    await store.saveOutgoingMessage('client-1', 'chat-1', 'what I said');
+
+    // A sender cannot decrypt their own ciphertext, so this log is the only way the
+    // message is readable to us again after a reload.
+    expect(await store.loadOutgoingMessage('client-1')).toBe('what I said');
+    store.close();
+  });
+
+  it('returns null for a message this device did not send', async () => {
+    const store = await unlock();
+    expect(await store.loadOutgoingMessage('sent-elsewhere')).toBeNull();
+    store.close();
+  });
+
+  it('loads a whole chat keyed by client message id', async () => {
+    const store = await unlock();
+    await store.saveOutgoingMessage('client-1', 'chat-1', 'first');
+    await store.saveOutgoingMessage('client-2', 'chat-1', 'second');
+    await store.saveOutgoingMessage('client-3', 'chat-2', 'other chat');
+
+    const messages = await store.loadOutgoingMessages('chat-1');
+    expect(messages.size).toBe(2);
+    expect(messages.get('client-1')).toBe('first');
+    expect(messages.get('client-2')).toBe('second');
+    store.close();
+  });
+
+  it('does not store the plaintext in the clear', async () => {
+    const store = await unlock();
+    await store.saveOutgoingMessage('client-1', 'chat-1', 'a secret sentence');
+    store.close();
+
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const open = indexedDB.open(databaseName);
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    const record = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const get = db.transaction('outgoing', 'readonly').objectStore('outgoing').get('client-1');
+      get.onsuccess = () => resolve(get.result);
+      get.onerror = () => reject(get.error);
+    });
+    db.close();
+
+    expect(JSON.stringify(record)).not.toContain('a secret sentence');
+  });
+
+  it('survives a reopen', async () => {
+    const first = await unlock();
+    await first.saveOutgoingMessage('client-1', 'chat-1', 'persisted');
+    first.close();
+
+    const second = await unlock();
+    expect(await second.loadOutgoingMessage('client-1')).toBe('persisted');
+    second.close();
+  });
+});
+
 describe('clearing the vault', () => {
   it('wipes every store and locks', async () => {
     const store = await unlock();

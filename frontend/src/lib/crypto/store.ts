@@ -21,10 +21,11 @@
 import { IV_LEN, fromBase64, randomBytes, toBase64, utf8, wipe } from './primitives';
 import { aeadOpen, aeadSeal } from './primitives';
 import type { RatchetState } from './doubleRatchet';
+import type { SenderKeyState } from './senderKey';
 import type { IdentityKeyPair, OneTimePreKey, SignedPreKey } from './x3dh';
 
 const DB_NAME = 'walkerchat-crypto';
-const DB_VERSION = 1;
+const DB_VERSION = 3;
 
 const STORE_META = 'meta';
 const STORE_IDENTITY = 'identity';
@@ -32,6 +33,8 @@ const STORE_SIGNED_PREKEYS = 'signedPreKeys';
 const STORE_ONE_TIME_PREKEYS = 'oneTimePreKeys';
 const STORE_SESSIONS = 'sessions';
 const STORE_PEERS = 'peers';
+const STORE_OUTGOING = 'outgoing';
+const STORE_SENDER_KEYS = 'senderKeys';
 
 const ALL_STORES = [
   STORE_META,
@@ -40,6 +43,8 @@ const ALL_STORES = [
   STORE_ONE_TIME_PREKEYS,
   STORE_SESSIONS,
   STORE_PEERS,
+  STORE_OUTGOING,
+  STORE_SENDER_KEYS,
 ];
 
 /**
@@ -90,6 +95,14 @@ export const openDatabase = (name: string = DB_NAME): Promise<IDBDatabase> =>
       if (!db.objectStoreNames.contains(STORE_PEERS)) {
         db.createObjectStore(STORE_PEERS, { keyPath: 'peerId' });
       }
+      if (!db.objectStoreNames.contains(STORE_SENDER_KEYS)) {
+        const senderKeys = db.createObjectStore(STORE_SENDER_KEYS, { keyPath: 'id' });
+        senderKeys.createIndex('distributionId', 'distributionId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(STORE_OUTGOING)) {
+        const outgoing = db.createObjectStore(STORE_OUTGOING, { keyPath: 'clientMessageId' });
+        outgoing.createIndex('chatId', 'chatId', { unique: false });
+      }
     };
     open.onsuccess = () => resolve(open.result);
     open.onerror = () => reject(open.error);
@@ -125,6 +138,10 @@ const decodeState = (bytes: Uint8Array): RatchetState =>
     return value;
   }) as RatchetState;
 
+/** One sender chain per (group, member). */
+export const senderKeyId = (distributionId: string, senderId: string): string =>
+  distributionId + '/' + senderId;
+
 /**
  * Sessions are keyed by peer *and* peer identity key. Keying by peer alone means that
  * when someone re-registers, the stale session keeps producing ciphertext nobody can
@@ -158,6 +175,27 @@ export class CryptoStore {
    * Throws on a wrong password rather than failing later with an opaque decryption
    * error somewhere deep in the ratchet.
    */
+  /** This installation's stable device id, created on first unlock. */
+  async deviceId(): Promise<string> {
+    const readTx = this.db.transaction(STORE_META, 'readonly');
+    const existing = (await request(readTx.objectStore(STORE_META).get('device'))) as
+      | { id: string; deviceId: string }
+      | undefined;
+
+    if (existing) {
+      return existing.deviceId;
+    }
+
+    // Generated locally and never regenerated: it is what ties this browser profile's
+    // ratchets to a row the server can address envelopes to.
+    const deviceId = crypto.randomUUID();
+    const tx = this.db.transaction(STORE_META, 'readwrite');
+    tx.objectStore(STORE_META).put({ id: 'device', deviceId });
+    await transactionDone(tx);
+
+    return deviceId;
+  }
+
   static async unlock(
     password: string,
     options: { databaseName?: string; iterations?: number } = {},
@@ -383,6 +421,129 @@ export class CryptoStore {
     await transactionDone(tx);
   }
 
+  // --- sender keys (groups) ------------------------------------------------
+
+  /**
+   * Persist one sender chain.
+   *
+   * Sealed like sessions are: a sender key reads every message that member sends to the
+   * group until they rotate, so it is exactly as sensitive as a ratchet root key.
+   */
+  async saveSenderKey(state: SenderKeyState): Promise<void> {
+    const encoded = utf8(
+      JSON.stringify(state, (_key, value) =>
+        value instanceof Uint8Array ? { $bytes: toBase64(value) } : value,
+      ),
+    );
+    const wrapped = await this.seal(encoded);
+    wipe(encoded);
+
+    const tx = this.db.transaction(STORE_SENDER_KEYS, 'readwrite');
+    tx.objectStore(STORE_SENDER_KEYS).put({
+      id: senderKeyId(state.distributionId, state.senderId),
+      distributionId: state.distributionId,
+      wrapped,
+    });
+    await transactionDone(tx);
+  }
+
+  async loadSenderKey(
+    distributionId: string,
+    senderId: string,
+  ): Promise<SenderKeyState | null> {
+    const tx = this.db.transaction(STORE_SENDER_KEYS, 'readonly');
+    const record = (await request(
+      tx.objectStore(STORE_SENDER_KEYS).get(senderKeyId(distributionId, senderId)),
+    )) as { wrapped: SealedBlob } | undefined;
+    if (!record) {
+      return null;
+    }
+
+    const bytes = await this.open(record.wrapped);
+    return JSON.parse(new TextDecoder().decode(bytes), (_key, value) => {
+      if (
+        value &&
+        typeof value === 'object' &&
+        typeof (value as { $bytes?: string }).$bytes === 'string'
+      ) {
+        return fromBase64((value as { $bytes: string }).$bytes);
+      }
+      return value;
+    }) as SenderKeyState;
+  }
+
+  /**
+   * Drop every sender chain for a group.
+   *
+   * Used when membership changes: everyone rotates, so the old chains are dead and
+   * keeping them around only preserves keys a departed member also holds.
+   */
+  async clearSenderKeys(distributionId: string): Promise<void> {
+    const readTx = this.db.transaction(STORE_SENDER_KEYS, 'readonly');
+    const ids = (await request(
+      readTx.objectStore(STORE_SENDER_KEYS).index('distributionId').getAllKeys(distributionId),
+    )) as string[];
+
+    if (ids.length === 0) {
+      return;
+    }
+
+    const tx = this.db.transaction(STORE_SENDER_KEYS, 'readwrite');
+    const store = tx.objectStore(STORE_SENDER_KEYS);
+    ids.forEach((id) => store.delete(id));
+    await transactionDone(tx);
+  }
+
+  // --- outgoing message log ------------------------------------------------
+
+  /**
+   * Keep our own sent plaintext.
+   *
+   * A ratchet encrypts to the *recipient's* chain, so a sender genuinely cannot decrypt
+   * their own ciphertext -- not on reload, not ever. Reading back your own history
+   * therefore requires keeping a local copy, which is why this exists. It is sealed
+   * under the vault key like everything else.
+   */
+  async saveOutgoingMessage(
+    clientMessageId: string,
+    chatId: string,
+    plaintext: string,
+  ): Promise<void> {
+    const wrapped = await this.seal(utf8(plaintext));
+
+    const tx = this.db.transaction(STORE_OUTGOING, 'readwrite');
+    tx.objectStore(STORE_OUTGOING).put({ clientMessageId, chatId, wrapped });
+    await transactionDone(tx);
+  }
+
+  /** Our sent plaintext for one message, or null if this device did not send it. */
+  async loadOutgoingMessage(clientMessageId: string): Promise<string | null> {
+    const tx = this.db.transaction(STORE_OUTGOING, 'readonly');
+    const record = (await request(tx.objectStore(STORE_OUTGOING).get(clientMessageId))) as
+      | { wrapped: SealedBlob }
+      | undefined;
+    if (!record) {
+      return null;
+    }
+    return new TextDecoder().decode(await this.open(record.wrapped));
+  }
+
+  /** Every message this device sent in one chat, keyed by client message id. */
+  async loadOutgoingMessages(chatId: string): Promise<Map<string, string>> {
+    const tx = this.db.transaction(STORE_OUTGOING, 'readonly');
+    const records = (await request(
+      tx.objectStore(STORE_OUTGOING).index('chatId').getAll(chatId),
+    )) as { clientMessageId: string; wrapped: SealedBlob }[];
+
+    const entries = await Promise.all(
+      records.map(
+        async (record) =>
+          [record.clientMessageId, new TextDecoder().decode(await this.open(record.wrapped))] as const,
+      ),
+    );
+    return new Map(entries);
+  }
+
   // --- peer trust ----------------------------------------------------------
 
   /**
@@ -416,6 +577,23 @@ export class CryptoStore {
     await transactionDone(tx);
 
     return { changed, previous };
+  }
+
+  /**
+   * Every device we have seen for a user.
+   *
+   * Peer ids are `userId:deviceId`, so a prefix range collects one user's installations.
+   * Safety numbers are computed over the whole set: verifying one device of an account
+   * says nothing about the others.
+   */
+  async loadPeerIdentitiesForUser(userId: string): Promise<PeerIdentityRecord[]> {
+    const tx = this.db.transaction(STORE_PEERS, 'readonly');
+    const range = IDBKeyRange.bound(userId + ':', userId + ':￿');
+    const records = (await request(
+      tx.objectStore(STORE_PEERS).getAll(range),
+    )) as PeerIdentityRecord[];
+
+    return records.sort((left, right) => left.peerId.localeCompare(right.peerId));
   }
 
   async loadPeerIdentity(peerId: string): Promise<PeerIdentityRecord | null> {
