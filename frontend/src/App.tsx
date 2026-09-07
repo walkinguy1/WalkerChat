@@ -5,11 +5,14 @@ import {
   fetchHistory,
   fetchIceConfig,
   claimPrekeyBundle,
+  createChat,
+  fetchDevices,
   fetchPrekeyCount,
   fetchWsTicket,
   login,
   logout,
   publishKeys,
+  searchUsers,
   uploadOneTimePreKeys,
 } from './lib/api';
 import { CryptoStore } from './lib/crypto/store';
@@ -19,9 +22,11 @@ import {
   bootstrapIdentity,
   replenishOneTimePreKeys,
 } from './lib/crypto/session';
+import { GroupSessionManager, decodeDistribution } from './lib/crypto/groups';
 import {
   buildReactionTallies,
   buildReplyRef,
+  acknowledgeMessage,
   createOptimisticDisplayMessage,
   encodeMessagePayload,
   encodeReactionPayload,
@@ -42,6 +47,9 @@ import { Composer } from './components/Composer';
 import { CallOverlay } from './components/CallOverlay';
 import { CommandPalette } from './components/CommandPalette';
 import { Lightbox, type LightboxImage } from './components/Lightbox';
+import { SafetyNumberDialog } from './components/SafetyNumberDialog';
+import { NewChatDialog } from './components/NewChatDialog';
+import { useSafetyNumber } from './hooks/useSafetyNumber';
 import { Toaster } from './components/ui/Toaster';
 import { Logo } from './components/ui/Logo';
 import type {
@@ -53,6 +61,7 @@ import type {
   ImageAttachment,
   ReactionEvent,
   RealtimeEvent,
+  SenderKeyEvent,
   ReplyRef,
   WebRtcSignalEvent,
 } from './types/chat';
@@ -103,6 +112,10 @@ const App = () => {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [wsTicket, setWsTicket] = useState<string | null>(null);
   const [sessionManager, setSessionManager] = useState<SessionManager | null>(null);
+  const [groupManager, setGroupManager] = useState<GroupSessionManager | null>(null);
+  /** This installation's ids: the local one, and the row the server addresses. */
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [deviceRowId, setDeviceRowId] = useState<string | null>(null);
   const [cryptoStore, setCryptoStore] = useState<CryptoStore | null>(null);
   const [signingInUsername, setSigningInUsername] = useState<string | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
@@ -110,6 +123,10 @@ const App = () => {
   const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [isSafetyNumberOpen, setIsSafetyNumberOpen] = useState(false);
+  const [isNewChatOpen, setIsNewChatOpen] = useState(false);
+  /** Peers whose identity key changed during this session. */
+  const [changedPeerIds, setChangedPeerIds] = useState<Set<string>>(new Set());
 
   const typingTimeoutRef = useRef<number | null>(null);
   // Set after useWebRTC initialises, so the socket handler below can reach it
@@ -122,6 +139,7 @@ const App = () => {
       ReturnType<typeof resolveEnvelope> | null
     >) | null
   >(null);
+  const acceptSenderKeyRef = useRef<((event: SenderKeyEvent) => Promise<void>) | null>(null);
 
   const currentUser = useMemo(
     () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
@@ -137,6 +155,14 @@ const App = () => {
     if (!activeChat || !currentUser) return null;
     return activeChat.members.find((member) => member.user_id !== currentUser.id) ?? null;
   }, [activeChat, currentUser]);
+
+  const safetyNumber = useSafetyNumber({
+    store: cryptoStore,
+    selfUserId: currentUser?.id ?? null,
+    selfIdentityKey: sessionManager?.identityKey ?? null,
+    peerUserId: peer?.user_id ?? null,
+    changedPeerIds,
+  });
 
   /** Replaying the reaction log in send order makes arrival order irrelevant. */
   const reactionsByMessageId = useMemo(() => buildReactionTallies(reactions), [reactions]);
@@ -158,8 +184,29 @@ const App = () => {
         return;
       }
 
+      if (message.type === 'sender_key') {
+        // Group key setup. It arrives over the pairwise session, so accepting it is
+        // proof the sender holds that session, not merely that they claim to.
+        void acceptSenderKeyRef.current?.(message);
+        return;
+      }
+
       if (message.type === 'chat_message') {
         if (message.chat_id === activeChat.id) {
+          // Our own echo: the ratchet encrypts to the recipient's chain, so we cannot
+          // decrypt it. It only confirms delivery and carries the server's id.
+          if (message.sender_id === currentUser.id) {
+            setMessages((previousMessages) =>
+              acknowledgeMessage(
+                previousMessages,
+                message.client_message_id,
+                message.message_id,
+                message.sent_at ?? new Date().toISOString(),
+              ),
+            );
+            return;
+          }
+
           void decryptEnvelopeRef.current?.(message).then((resolved) => {
             if (!resolved) {
               return;
@@ -329,13 +376,14 @@ const App = () => {
    * a network round trip for history we already hold.
    */
   useEffect(() => {
-    if (!activeChatId || !authToken) {
+    // History is resolved per device, so wait until we know which one we are.
+    if (!activeChatId || !authToken || !deviceId) {
       return;
     }
 
     let isActive = true;
 
-    fetchHistory(apiUrl, activeChatId, authToken)
+    fetchHistory(apiUrl, activeChatId, authToken, deviceId)
       .then((payload) => {
         if (!isActive) return;
         setHistoryRecords(payload.items);
@@ -351,7 +399,7 @@ const App = () => {
     return () => {
       isActive = false;
     };
-  }, [activeChatId, authToken]);
+  }, [activeChatId, authToken, deviceId]);
 
   /**
    * Decrypt one stored or live envelope.
@@ -369,16 +417,70 @@ const App = () => {
         return null;
       }
 
+      // A live event carries the whole envelope map and we pick ours out; a history
+      // record has already been resolved to this device's single envelope.
+      const ciphertext =
+        'ciphertext' in record
+          ? record.ciphertext
+          : ((deviceRowId ? record.envelopes[deviceRowId] : undefined) ??
+            record.envelopes['*']);
+
+      // Our own messages are unreadable from the ciphertext by design, so they come
+      // from the local sent log instead.
+      if (currentUser && record.sender_id === currentUser.id) {
+        const clientMessageId = record.client_message_id;
+        const ownPlaintext = clientMessageId
+          ? await cryptoStore?.loadOutgoingMessage(clientMessageId)
+          : null;
+
+        if (ownPlaintext == null) {
+          // Sent from another device, or from a browser profile whose log we do not
+          // have. Saying so is better than showing a decryption failure.
+          return {
+            kind: 'message',
+            message: {
+              id: record.message_id ?? clientMessageId,
+              clientMessageId,
+              serverMessageId: record.message_id,
+              senderId: record.sender_id,
+              body: '',
+              sentAt: record.sent_at ?? new Date().toISOString(),
+              state: 'failed',
+            },
+          };
+        }
+
+        return resolveEnvelope(record, ownPlaintext);
+      }
+
       try {
-        const plaintext = await sessionManager.decrypt(record.sender_id, record.ciphertext);
+        // Group messages ride a sender key chain; direct messages ride the pairwise
+        // ratchet. Which one applies is a property of the chat, not the payload.
+        // Group messages ride a sender key chain, keyed by sender account. Direct
+        // messages ride the pairwise ratchet, keyed by sender *device*.
+        let plaintext: string;
+        if (activeChat?.kind === 'room' && groupManager) {
+          plaintext = await groupManager.decrypt(
+            activeChat.id,
+            record.sender_id,
+            ciphertext ?? '',
+          );
+        } else {
+          if (!record.sender_device_row_id) {
+            throw new DecryptionFailure('Message does not name a sender device.');
+          }
+          plaintext = await sessionManager.decrypt(
+            { userId: record.sender_id, deviceRowId: record.sender_device_row_id },
+            ciphertext ?? '',
+          );
+        }
         return resolveEnvelope(record, plaintext);
       } catch (error) {
         if (!(error instanceof DecryptionFailure)) {
           throw error;
         }
 
-        const clientMessageId =
-          'client_message_id' in record ? record.client_message_id : record.message_id;
+        const clientMessageId = record.client_message_id;
         return {
           kind: 'message',
           message: {
@@ -393,12 +495,46 @@ const App = () => {
         };
       }
     },
-    [sessionManager],
+    [activeChat, cryptoStore, currentUser, deviceRowId, groupManager, sessionManager],
+  );
+
+  /**
+   * Unwrap a sender key distribution and store the sender's chain for that group.
+   *
+   * A distribution that does not decrypt is dropped in silence: it means we have no
+   * pairwise session with the claimed sender, which is exactly what a forged one would
+   * look like.
+   */
+  const acceptSenderKey = useCallback(
+    async (event: SenderKeyEvent) => {
+      if (!sessionManager || !groupManager) {
+        return;
+      }
+
+      if (!event.sender_device_row_id) {
+        return;
+      }
+
+      try {
+        const plaintext = await sessionManager.decrypt(
+          { userId: event.sender_id, deviceRowId: event.sender_device_row_id },
+          event.ciphertext,
+        );
+        const distribution = decodeDistribution(plaintext);
+        if (distribution && distribution.distributionId === event.chat_id) {
+          await groupManager.acceptDistribution(distribution);
+        }
+      } catch {
+        // Nothing to show the user: this is key setup, not conversation.
+      }
+    },
+    [groupManager, sessionManager],
   );
 
   useEffect(() => {
     decryptEnvelopeRef.current = decryptEnvelope;
-  }, [decryptEnvelope]);
+    acceptSenderKeyRef.current = acceptSenderKey;
+  }, [acceptSenderKey, decryptEnvelope]);
 
   /**
    * Decrypt whatever history we hold. Re-runs once the session is ready, so messages
@@ -458,7 +594,7 @@ const App = () => {
    * forward secrecy until the ratchet turns.
    */
   useEffect(() => {
-    if (!authToken || !cryptoStore) {
+    if (!authToken || !cryptoStore || !deviceId) {
       return;
     }
 
@@ -466,13 +602,13 @@ const App = () => {
 
     void (async () => {
       try {
-        const count = await fetchPrekeyCount(apiUrl, authToken);
+        const count = await fetchPrekeyCount(apiUrl, authToken, deviceId);
         if (!isActive || !count.should_replenish) {
           return;
         }
         const preKeys = await replenishOneTimePreKeys(cryptoStore);
         if (isActive) {
-          await uploadOneTimePreKeys(apiUrl, authToken, preKeys);
+          await uploadOneTimePreKeys(apiUrl, authToken, deviceId, preKeys);
         }
       } catch (error) {
         // Not fatal: the handshake degrades rather than failing outright.
@@ -483,7 +619,7 @@ const App = () => {
     return () => {
       isActive = false;
     };
-  }, [authToken, cryptoStore]);
+  }, [authToken, cryptoStore, deviceId]);
 
   /** Broadcast typing state, debounced back to idle after a pause. */
   useEffect(() => {
@@ -564,6 +700,7 @@ const App = () => {
 
       cryptoStore?.close();
       setSessionManager(null);
+      setGroupManager(null);
       setCryptoStore(null);
       setWsTicket(null);
 
@@ -576,23 +713,41 @@ const App = () => {
       });
 
       const bootstrapped = await bootstrapIdentity(store);
+      setDeviceId(bootstrapped.deviceId);
+
       if (bootstrapped.publish) {
-        await publishKeys(apiUrl, tokenData.access_token, bootstrapped.publish);
+        const published = await publishKeys(
+          apiUrl,
+          tokenData.access_token,
+          bootstrapped.publish,
+        );
+        setDeviceRowId(published.device_row_id);
+      } else {
+        // Already registered: ask the server which row this installation is.
+        const devices = await fetchDevices(apiUrl, tokenData.user_id, tokenData.access_token);
+        setDeviceRowId(
+          devices.find((device) => device.device_id === bootstrapped.deviceId)
+            ?.device_row_id ?? null,
+        );
       }
 
       setCryptoStore(store);
-      setSessionManager(
-        new SessionManager({
-          store,
-          identity: bootstrapped.identity,
-          fetchBundle: (peerId) => claimPrekeyBundle(apiUrl, peerId, tokenData.access_token),
-          onIdentityChange: ({ peerId }) => {
-            // The only defence against a server swapping keys is telling the user.
-            pushToast(
-              `Security code for ${peerId} changed. Verify their safety number before trusting this chat.`,
-            );
-          },
-        }),
+      const sessions = new SessionManager({
+        store,
+        identity: bootstrapped.identity,
+        fetchBundle: (peerId) => claimPrekeyBundle(apiUrl, peerId, tokenData.access_token),
+        onIdentityChange: ({ peerId }) => {
+          // The only defence against a server swapping keys is telling the user.
+          setChangedPeerIds((previous) => new Set(previous).add(peerId));
+          pushToast(
+            'This contact’s safety number changed. Verify it before trusting this chat.',
+          );
+        },
+      });
+
+      setSessionManager(sessions);
+      setGroupManager(
+        new GroupSessionManager({ store, sessions, selfId: tokenData.user_id }),
       );
 
       setAuthToken(tokenData.access_token);
@@ -624,7 +779,13 @@ const App = () => {
       setAuthToken(null);
       setWsTicket(null);
       setSessionManager(null);
+      setGroupManager(null);
       setCryptoStore(null);
+      setDeviceId(null);
+      setDeviceRowId(null);
+      setChangedPeerIds(new Set());
+      setIsSafetyNumberOpen(false);
+      setIsNewChatOpen(false);
       setSelectedUserId(null);
       setActiveChatId(null);
       setBootstrap(null);
@@ -647,14 +808,71 @@ const App = () => {
    * The session layer establishes the X3DH session on first use and ratchets from then
    * on, so callers no longer hold a key at all.
    */
-  const encryptForPeer = async (plaintext: string): Promise<string | null> => {
-    if (!sessionManager || !peer) {
+  /**
+   * Encrypt for a chat, producing one envelope per recipient device.
+   *
+   * The "*" key marks a group message: Sender Keys produce a single ciphertext for the
+   * whole membership, whereas the pairwise ratchet needs one per installation.
+   */
+  const encryptForChat = async (
+    plaintext: string,
+  ): Promise<Record<string, string> | null> => {
+    if (!sessionManager || !activeChat || !currentUser) {
       pushToast('The secure session is not ready yet.');
       return null;
     }
 
     try {
-      return await sessionManager.encrypt(peer.user_id, plaintext);
+      if (activeChat.kind === 'room') {
+        if (!groupManager) {
+          pushToast('The secure session is not ready yet.');
+          return null;
+        }
+
+        const memberIds = activeChat.members.map((member) => member.user_id);
+        const { message, distributions } = await groupManager.encrypt(
+          activeChat.id,
+          memberIds,
+          plaintext,
+        );
+
+        // Hand each member's *device* our sender key over its pairwise session. These
+        // are relayed, never stored. A device that cannot read one simply ignores it.
+        for (const distribution of distributions) {
+          sendMessage({
+            type: 'sender_key',
+            chat_id: activeChat.id,
+            sender_id: currentUser.id,
+            sender_device_id: deviceId ?? undefined,
+            target_id: distribution.userId,
+            ciphertext: distribution.ciphertext,
+            sent_at: new Date().toISOString(),
+          });
+        }
+
+        return { '*': message };
+      }
+
+      if (!peer) {
+        pushToast('The secure session is not ready yet.');
+        return null;
+      }
+
+      const envelopes = await sessionManager.encryptForUser(peer.user_id, plaintext);
+
+      // Our own other installations get a copy too, so the conversation is readable
+      // everywhere we are signed in. Our own device is excluded: we cannot decrypt
+      // what we encrypted to ourselves, and the local sent log covers it.
+      const ownEnvelopes = await sessionManager.encryptForUser(currentUser.id, plaintext, {
+        excludeDeviceRowId: deviceRowId ?? undefined,
+      });
+
+      const combined = { ...envelopes, ...ownEnvelopes };
+      if (Object.keys(combined).length === 0) {
+        pushToast('That contact has no devices able to receive messages yet.');
+        return null;
+      }
+      return combined;
     } catch (error) {
       pushToast(
         error instanceof Error
@@ -675,20 +893,25 @@ const App = () => {
       return false;
     }
 
-    const ciphertext = await encryptForPeer(
-      encodeMessagePayload(caption, attachment, replyRef),
-    );
-    if (!ciphertext) {
+    const plaintext = encodeMessagePayload(caption, attachment, replyRef);
+    const envelopes = await encryptForChat(plaintext);
+    if (!envelopes) {
       return false;
     }
+
+    const clientMessageId = crypto.randomUUID();
+    // Keep our own plaintext: it is the only way this message is readable to us again
+    // after a reload, because we cannot decrypt what we encrypted to the peer.
+    await cryptoStore?.saveOutgoingMessage(clientMessageId, activeChat.id, plaintext);
 
     const outboundMessage: ChatMessageEvent = {
       type: 'chat_message',
       chat_id: activeChat.id,
-      client_message_id: crypto.randomUUID(),
+      client_message_id: clientMessageId,
       sender_id: currentUser.id,
+      sender_device_id: deviceId ?? undefined,
       target_id: peer.user_id,
-      ciphertext,
+      envelopes,
       is_media: Boolean(attachment),
       sent_at: new Date().toISOString(),
     };
@@ -752,8 +975,8 @@ const App = () => {
     const action = alreadyMine ? 'remove' : 'add';
 
     try {
-      const ciphertext = await encryptForPeer(encodeReactionPayload(message.id, emoji, action));
-      if (!ciphertext) {
+      const envelopes = await encryptForChat(encodeReactionPayload(message.id, emoji, action));
+      if (!envelopes) {
         return;
       }
 
@@ -765,8 +988,9 @@ const App = () => {
         chat_id: activeChat.id,
         client_message_id: clientMessageId,
         sender_id: currentUser.id,
+        sender_device_id: deviceId ?? undefined,
         target_id: peer.user_id,
-        ciphertext,
+        envelopes,
         is_media: false,
         sent_at: sentAt,
       } satisfies ChatMessageEvent);
@@ -961,6 +1185,7 @@ const App = () => {
             setIsSidebarOpen(false);
           }}
           onOpenSearch={() => setIsSearchOpen(true)}
+          onNewChat={() => setIsNewChatOpen(true)}
           onSignOut={() => void handleSignOut()}
           onClose={() => setIsSidebarOpen(false)}
         />
@@ -973,6 +1198,8 @@ const App = () => {
           peerPresence={peerPresence}
           connectionState={connectionState}
           isSecure={Boolean(sessionManager)}
+          verification={safetyNumber.state}
+          onOpenSafetyNumber={() => setIsSafetyNumberOpen(true)}
           isPeerTyping={typingUserId === peer?.user_id}
           canCall={Boolean(peer) && !call.isCallActive && isSocketOpen}
           onlineCount={onlineMemberCount}
@@ -1043,6 +1270,34 @@ const App = () => {
       />
 
       <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
+      <NewChatDialog
+        open={isNewChatOpen}
+        onClose={() => setIsNewChatOpen(false)}
+        onSearch={async (query) => (authToken ? searchUsers(apiUrl, authToken, query) : [])}
+        onCreate={async ({ type, name, memberIds }) => {
+          if (!authToken) return;
+          try {
+            const created = await createChat(apiUrl, authToken, {
+              type,
+              name,
+              member_ids: memberIds,
+            });
+            // Re-fetch rather than patching state: the server decides the final
+            // membership, and a direct chat may resolve to an existing thread.
+            setBootstrap(await fetchBootstrap(apiUrl, authToken));
+            setActiveChatId(created.chat_id);
+            setIsNewChatOpen(false);
+          } catch (error) {
+            pushToast(error instanceof Error ? error.message : 'Unable to create that chat.');
+          }
+        }}
+      />
+      <SafetyNumberDialog
+        open={isSafetyNumberOpen}
+        peerName={peer?.display_name ?? 'this contact'}
+        safetyNumber={safetyNumber}
+        onClose={() => setIsSafetyNumberOpen(false)}
+      />
       <Toaster />
     </div>
   );
