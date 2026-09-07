@@ -142,8 +142,9 @@ material and make identity changes visible.
 | `POST /api/keys/publish` | Publish identity key, signed prekey and an initial OPK batch |
 | `POST /api/keys/signed-prekey` | Rotate the signed prekey |
 | `POST /api/keys/opks` | Top up the one-time prekey pool |
-| `GET /api/keys/opks/count` | Remaining OPKs, with a replenish hint |
-| `POST /api/keys/{user_id}/bundle` | Claim a prekey bundle (consumes one OPK) |
+| `GET /api/keys/opks/count` | Remaining OPKs for one device, with a replenish hint |
+| `GET /api/keys/{user_id}/devices` | Every device an account has |
+| `POST /api/keys/{user_id}/bundle` | Claim a bundle per device (consumes one OPK each) |
 
 Four changes from the previous design, each fixing a specific defect:
 
@@ -215,10 +216,70 @@ string and can read it to each other.
 The identifier binds the fingerprint to an account, so the same key under a different
 username does not produce a matching safety number.
 
+## Groups: Sender Keys
+
+A pairwise ratchet per recipient would mean encrypting each group message once per
+member. Sender Keys instead give every member their own hash chain per group: a message
+is encrypted once and delivered to everyone.
+
+```
+chain step   mk  = HMAC-SHA256(ck, 0x01)
+             ck' = HMAC-SHA256(ck, 0x02)
+message keys     = HKDF-SHA256(ikm = mk, salt = 32 zero bytes,
+                               info = "WalkerChatSenderKeyMessageKeys", len = 44)
+                   -> (aes_key[32], iv[12])
+wire format      = iteration[uint32 BE] || ciphertext || XEdDSA signature[64]
+AEAD AD          = "<groupId>:<senderId>" || iteration
+```
+
+Three properties worth stating plainly:
+
+- **Every message is signed.** Every member holds every other member's chain key, so
+  without a per-sender signing key any member could forge messages in another member's
+  name. The signing private key never leaves its owner.
+- **Groups have no post-compromise security.** A leaked chain key stays useful until
+  that member rotates. Forward secrecy is retained (the chain only moves forward), and
+  rotation is what bounds the damage.
+- **Removing a member requires rotation.** They keep the chain keys they were given, so
+  removal alone does not stop them reading future messages. The API says so explicitly
+  in its response rather than implying the job is done.
+
+Distribution is the subtle part: a sender key is itself secret, so it travels to each
+recipient *device* over the pairwise Double Ratchet session with that device. Groups
+therefore depend on 1:1 sessions and inherit their authentication. A distribution
+carries the chain's *current* key, so someone added later cannot read earlier messages.
+
+## Multi-device
+
+Key material belongs to a **device**, not an account. It previously lived in a single set
+of columns on `users`, which meant signing in on a second browser overwrote the first
+device's identity key and silently broke every session it had.
+
+- Each installation generates a stable local device id on first unlock, plus its own
+  identity key, signed prekey and one-time prekeys.
+- `POST /api/keys/{user_id}/bundle` claims one prekey from **every** device the user has.
+- A message is encrypted once per recipient device and stored as one row per device in
+  `message_envelopes`. History is resolved per device: which ciphertext you get back
+  depends on which installation is asking.
+- The sender also encrypts to their **own** other devices, so a conversation is readable
+  everywhere they are signed in. Their own device is excluded, because a sender cannot
+  decrypt what they encrypted to a peer.
+- Safety numbers fold in *all* of an account's device keys, sorted. Adding a device
+  therefore changes the safety number, which is the intended behaviour: a new device is a
+  new key that can read the conversation, and the other party should be told rather than
+  quietly enrolled.
+
+Because a sender cannot decrypt their own ciphertext, sent plaintext is kept in a local
+sealed log (`outgoing`). Without it your own messages would be unreadable to you after a
+reload -- not a bug that can be fixed with better key management, but an inherent
+consequence of encrypting to the recipient's chain.
+
 ## What this does not protect
 
 - **Metadata.** The server sees who talks to whom, when, message sizes, and — because
   reactions are sent as messages — a per-reaction event count.
 - **Endpoint compromise.** Decrypted plaintext is indexed client-side for search and
   rendered to blob URLs for images. Anything with code execution in the page sees it.
-- **Group and multi-device** are not covered by this document yet.
+- **Group metadata.** Membership, group size, and who sends how often are all visible.
+- **A group member.** Sender Keys give every member the ability to read everything sent
+  to the group, and no post-compromise security within it.

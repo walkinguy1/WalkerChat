@@ -16,6 +16,7 @@ Before your first push:
 - End-to-end encryption: X3DH key agreement and the Double Ratchet, implemented against the published Signal specifications
 - Persistent WebSockets using Redis Pub/Sub
 - Encrypted Media Uploads to MinIO (S3-compatible)
+- Group chat with Sender Keys, and multi-device support
 - WebRTC Peer-to-Peer AV signaling
 - Background tasks scaling using Celery
 
@@ -31,11 +32,18 @@ Before your first push:
 - Signed prekeys are verified client-side before any key agreement, and identity-key
   changes surface as a safety-number warning.
 
+- Group chat uses Sender Keys, with per-message signatures and rotation on membership
+  change. Multi-device is supported: keys belong to a device, a message is encrypted once
+  per recipient installation, and safety numbers cover the whole device set.
+
 Still outstanding before this would be production-grade:
 
-- Group chat and multi-device are not implemented (`ChatType.GROUP` is unused).
 - Ratchet headers are not encrypted, so the server sees message counters. Metadata --
-  who talks to whom, when, and how often -- is not protected.
+  who talks to whom, when, how often, and group membership -- is not protected.
+- Groups have no post-compromise security: every member holds every other member's
+  sender chain key until it is rotated.
+- Removing someone from a group requires the remaining clients to rotate their sender
+  keys. The server flags this, but rotation is not yet triggered automatically.
 - The default JWT and object-storage secrets in `.env.example` are placeholders, the
   seeded demo accounts use a fixed password, and the `/test/*` debug routes are still
   mounted without authentication.
