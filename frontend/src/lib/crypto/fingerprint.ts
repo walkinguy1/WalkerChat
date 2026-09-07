@@ -22,10 +22,20 @@ const DIGITS_PER_GROUP = 5;
  * The identifier binds the fingerprint to a specific account, so an identical key under
  * a different username does not produce a matching safety number.
  */
-const numericFingerprint = (publicKey: Uint8Array, identifier: string): string => {
-  let hash = concat(VERSION, publicKey, utf8(identifier));
+const numericFingerprint = (identityKeys: Uint8Array[], identifier: string): string => {
+  // Sorted so both sides fold the devices in the same order regardless of the order
+  // the server happened to list them in.
+  const ordered = [...identityKeys].sort((left, right) => {
+    for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+      if (left[index] !== right[index]) return left[index] - right[index];
+    }
+    return left.length - right.length;
+  });
+  const material = concat(...ordered);
+
+  let hash = concat(VERSION, material, utf8(identifier));
   for (let iteration = 0; iteration < ITERATIONS; iteration += 1) {
-    hash = sha512Hash(concat(hash, publicKey));
+    hash = sha512Hash(concat(hash, material));
   }
 
   let digits = '';
@@ -42,7 +52,14 @@ const numericFingerprint = (publicKey: Uint8Array, identifier: string): string =
 };
 
 export type SafetyNumberParty = {
-  identityKey: Uint8Array;
+  /**
+   * Every identity key belonging to this account, one per device.
+   *
+   * All of them are folded in, so adding a device changes the safety number. That is
+   * the point: a new device is a new key that can read your messages, and the person
+   * you are talking to should be told, not quietly enrolled.
+   */
+  identityKeys: Uint8Array[];
   identifier: string;
 };
 
@@ -56,8 +73,8 @@ export const computeSafetyNumber = (
   self: SafetyNumberParty,
   peer: SafetyNumberParty,
 ): string => {
-  const mine = numericFingerprint(self.identityKey, self.identifier);
-  const theirs = numericFingerprint(peer.identityKey, peer.identifier);
+  const mine = numericFingerprint(self.identityKeys, self.identifier);
+  const theirs = numericFingerprint(peer.identityKeys, peer.identifier);
   return mine < theirs ? mine + theirs : theirs + mine;
 };
 
