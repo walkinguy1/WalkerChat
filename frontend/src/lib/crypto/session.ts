@@ -38,9 +38,12 @@ export const SIGNED_PREKEY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /** How many rotated signed prekeys to keep, so in-flight messages still decrypt. */
 const SIGNED_PREKEY_HISTORY = 3;
 
-/** The wire shape of a prekey bundle, as the API returns it (base64 fields). */
+/** One device's bundle, as the API returns it (base64 fields). */
 export type EncodedPreKeyBundle = {
-  user_id: string;
+  /** Server-side row id: what envelopes are addressed to. */
+  device_row_id: string;
+  /** Client-generated installation id. */
+  device_id: string;
   identity_key: string;
   identity_key_changed_at: string | null;
   signed_prekey_id: string;
@@ -50,7 +53,14 @@ export type EncodedPreKeyBundle = {
   one_time_prekey: string | null;
 };
 
+/** Every device a user has. A message needs one ciphertext per entry. */
+export type EncodedDeviceBundles = {
+  user_id: string;
+  devices: EncodedPreKeyBundle[];
+};
+
 export type PublishablePreKeys = {
+  deviceId: string;
   identityKey: string;
   signedPreKey: { keyId: string; publicKey: string; signature: string };
   oneTimePreKeys: { keyId: string; publicKey: string }[];
@@ -82,6 +92,8 @@ export class DecryptionFailure extends Error {
 export type IdentityBootstrap = {
   identity: IdentityKeyPair;
   signedPreKey: SignedPreKey;
+  /** This installation's stable id. */
+  deviceId: string;
   /** Present when there is new material for the server; null when nothing changed. */
   publish: PublishablePreKeys | null;
 };
@@ -93,6 +105,7 @@ export type IdentityBootstrap = {
  * reliably runs on every sign-in.
  */
 export const bootstrapIdentity = async (store: CryptoStore): Promise<IdentityBootstrap> => {
+  const deviceId = await store.deviceId();
   const existingIdentity = await store.loadIdentity();
 
   if (!existingIdentity) {
@@ -107,7 +120,9 @@ export const bootstrapIdentity = async (store: CryptoStore): Promise<IdentityBoo
     return {
       identity,
       signedPreKey,
+      deviceId,
       publish: {
+        deviceId,
         identityKey: toBase64(identity.publicKey),
         signedPreKey: {
           keyId: signedPreKey.keyId,
@@ -129,7 +144,7 @@ export const bootstrapIdentity = async (store: CryptoStore): Promise<IdentityBoo
 
   const isStale = !newest || Date.now() - newest.createdAt > SIGNED_PREKEY_MAX_AGE_MS;
   if (!isStale) {
-    return { identity: existingIdentity, signedPreKey: newest, publish: null };
+    return { identity: existingIdentity, signedPreKey: newest, deviceId, publish: null };
   }
 
   const rotated = createSignedPreKey(existingIdentity, crypto.randomUUID());
@@ -141,7 +156,9 @@ export const bootstrapIdentity = async (store: CryptoStore): Promise<IdentityBoo
   return {
     identity: existingIdentity,
     signedPreKey: rotated,
+    deviceId,
     publish: {
+      deviceId,
       identityKey: toBase64(existingIdentity.publicKey),
       signedPreKey: {
         keyId: rotated.keyId,
@@ -163,7 +180,24 @@ export const replenishOneTimePreKeys = async (
   return encodeOneTimePreKeys(preKeys);
 };
 
-export type BundleFetcher = (peerId: string) => Promise<EncodedPreKeyBundle>;
+/** Fetches every device bundle for a user, claiming one prekey from each. */
+export type BundleFetcher = (userId: string) => Promise<EncodedDeviceBundles>;
+
+/**
+ * A peer address: one installation, not one account.
+ *
+ * Sessions, ratchets and safety-number entries are all per device, so an account with
+ * two browsers open is two independent cryptographic peers.
+ */
+export type DeviceAddress = {
+  userId: string;
+  /** Server row id; what message envelopes are keyed by. */
+  deviceRowId: string;
+};
+
+/** Storage key for one device's session and identity record. */
+export const addressKey = (userId: string, deviceRowId: string): string =>
+  userId + ':' + deviceRowId;
 
 /**
  * Ratchet state plus the peer identity it belongs to.
@@ -220,10 +254,56 @@ export class SessionManager {
     return next;
   }
 
-  /** Encrypt a plaintext string for a peer, establishing a session if needed. */
-  encrypt(peerId: string, plaintext: string): Promise<string> {
+  /**
+   * Encrypt for one specific device, using a session already established with it.
+   *
+   * Used for sender key distribution, where the caller has already resolved the device
+   * list and wants one ciphertext per device.
+   */
+  encryptForDevice(address: DeviceAddress, plaintext: string): Promise<string> {
+    return this.encryptTo(addressKey(address.userId, address.deviceRowId), plaintext);
+  }
+
+  /**
+   * Encrypt for every device a user has.
+   *
+   * Returns one ciphertext per device, keyed by device row id, which is exactly the
+   * envelope map the server stores. A device that cannot be reached is skipped rather
+   * than failing the send: it simply will not see this message.
+   */
+  async encryptForUser(
+    userId: string,
+    plaintext: string,
+    options: { excludeDeviceRowId?: string } = {},
+  ): Promise<Record<string, string>> {
+    const bundles = await this.fetchBundle(userId);
+    const envelopes: Record<string, string> = {};
+
+    for (const bundle of bundles.devices) {
+      if (bundle.device_row_id === options.excludeDeviceRowId) {
+        continue;
+      }
+
+      try {
+        const key = addressKey(userId, bundle.device_row_id);
+        await this.rememberPeer(key, fromBase64(bundle.identity_key), userId);
+        envelopes[bundle.device_row_id] = await this.encryptTo(key, plaintext, bundle);
+      } catch {
+        // One unreachable device must not block the others.
+      }
+    }
+
+    return envelopes;
+  }
+
+  /** Encrypt against one stored session, establishing it from `bundle` if needed. */
+  private encryptTo(
+    peerId: string,
+    plaintext: string,
+    bundle?: EncodedPreKeyBundle,
+  ): Promise<string> {
     return this.enqueue(peerId, async () => {
-      const state = await this.loadOrCreateOutbound(peerId);
+      const state = await this.loadOrCreateOutbound(peerId, bundle);
       const result = await ratchetEncrypt(state, utf8(plaintext));
 
       const advanced: StoredSession = {
@@ -243,7 +323,8 @@ export class SessionManager {
    * the single worst flaw in the implementation this replaces, because it let anyone
    * who could write a message row inject unauthenticated messages.
    */
-  decrypt(peerId: string, ciphertextBase64: string): Promise<string> {
+  decrypt(address: DeviceAddress, ciphertextBase64: string): Promise<string> {
+    const peerId = addressKey(address.userId, address.deviceRowId);
     return this.enqueue(peerId, async () => {
       let encoded: Uint8Array;
       try {
@@ -262,7 +343,7 @@ export class SessionManager {
       }
 
       if (message.type === MESSAGE_TYPE_PREKEY) {
-        return this.decryptPreKeyMessage(peerId, message.prekey, encoded);
+        return this.decryptPreKeyMessage(peerId, address.userId, message.prekey, encoded);
       }
 
       const peer = await this.store.loadPeerIdentity(peerId);
@@ -285,10 +366,11 @@ export class SessionManager {
 
   private async decryptPreKeyMessage(
     peerId: string,
+    userId: string,
     prekey: { identityKey: Uint8Array; ephemeralKey: Uint8Array; signedPreKeyId: string; oneTimePreKeyId: string | null },
     encoded: Uint8Array,
   ): Promise<string> {
-    await this.rememberPeer(peerId, prekey.identityKey);
+    await this.rememberPeer(peerId, prekey.identityKey, userId);
 
     const existing = await this.store.loadSession(peerId, prekey.identityKey);
     if (existing) {
@@ -361,7 +443,10 @@ export class SessionManager {
     return fromUtf8(result.plaintext);
   }
 
-  private async loadOrCreateOutbound(peerId: string): Promise<StoredSession> {
+  private async loadOrCreateOutbound(
+    peerId: string,
+    encodedBundle?: EncodedPreKeyBundle,
+  ): Promise<StoredSession> {
     const known = await this.store.loadPeerIdentity(peerId);
     if (known) {
       const state = await this.store.loadSession(peerId, known.identityKey);
@@ -370,8 +455,12 @@ export class SessionManager {
       }
     }
 
-    const bundle = decodeBundle(await this.fetchBundle(peerId));
-    await this.rememberPeer(peerId, bundle.identityKey);
+    if (!encodedBundle) {
+      throw new Error('No session with ' + peerId + ' and no prekey bundle to build one.');
+    }
+
+    const bundle = decodeBundle(encodedBundle);
+    await this.rememberPeer(peerId, bundle.identityKey, peerId.split(':')[0]);
 
     // initiateX3DH verifies the signed prekey signature and throws if it does not
     // check out. There is no unsigned path.
@@ -388,13 +477,18 @@ export class SessionManager {
     };
   }
 
-  private async rememberPeer(peerId: string, identityKey: Uint8Array): Promise<void> {
+  private async rememberPeer(
+    peerId: string,
+    identityKey: Uint8Array,
+    userId: string,
+  ): Promise<void> {
     const { changed, previous } = await this.store.rememberPeerIdentity(peerId, identityKey);
     if (changed && previous) {
       // The UI turns this into a safety-number warning. Without it, a server swapping
-      // identity keys is completely invisible to the user.
+      // identity keys is completely invisible to the user. Reported against the account,
+      // because that is what the user recognises.
       this.onIdentityChange({
-        peerId,
+        peerId: userId,
         previousIdentityKey: previous.identityKey,
         newIdentityKey: identityKey,
       });
