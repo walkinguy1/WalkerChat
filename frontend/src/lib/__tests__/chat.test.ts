@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { compareSentAt, mergeMessages } from '../chat';
+import { acknowledgeMessage, compareSentAt, mergeMessages } from '../chat';
 import type { DisplayMessage } from '../../types/chat';
 
 const message = (overrides: Partial<DisplayMessage>): DisplayMessage => ({
@@ -102,5 +102,51 @@ describe('mergeMessages', () => {
 
     const merged = mergeMessages(mergeMessages([], later), earlier);
     expect(merged.map((entry) => entry.clientMessageId)).toEqual(['a', 'b']);
+  });
+});
+
+describe('acknowledgeMessage', () => {
+  it('marks the optimistic copy sent without touching its body', () => {
+    // The echo of our own message is never decrypted, so the body has to survive.
+    const pending = message({ clientMessageId: 'client-1', body: 'what I said' });
+    const acknowledged = acknowledgeMessage(
+      [pending],
+      'client-1',
+      'server-1',
+      '2026-09-05T10:00:02',
+    );
+
+    expect(acknowledged).toHaveLength(1);
+    expect(acknowledged[0].body).toBe('what I said');
+    expect(acknowledged[0].state).toBe('sent');
+    expect(acknowledged[0].serverMessageId).toBe('server-1');
+    expect(acknowledged[0].id).toBe('server-1');
+  });
+
+  it('adopts the server timestamp', () => {
+    const pending = message({ clientMessageId: 'client-1', sentAt: '2026-09-05T09:59:00.000Z' });
+    const acknowledged = acknowledgeMessage([pending], 'client-1', 'server-1', '2026-09-05T10:00:02');
+
+    expect(acknowledged[0].sentAt).toBe('2026-09-05T10:00:02');
+  });
+
+  it('ignores an echo with no local copy', () => {
+    // Sent from another tab or device: nothing to reconcile, and nothing decryptable.
+    const existing = message({ clientMessageId: 'client-1' });
+    expect(acknowledgeMessage([existing], 'client-999', 'server-9', '2026-09-05T10:00:02')).toEqual([
+      existing,
+    ]);
+  });
+
+  it('leaves other messages untouched', () => {
+    const first = message({ clientMessageId: 'client-1', body: 'first' });
+    const second = message({
+      clientMessageId: 'client-2',
+      body: 'second',
+      sentAt: '2026-09-05T10:00:01.000Z',
+    });
+
+    const acknowledged = acknowledgeMessage([first, second], 'client-1', 'server-1', '2026-09-05T10:00:00');
+    expect(acknowledged.find((entry) => entry.clientMessageId === 'client-2')?.state).toBe('sending');
   });
 });

@@ -170,8 +170,7 @@ export const resolveEnvelope = (
   | { kind: 'message'; message: DisplayMessage }
   | { kind: 'reaction'; reaction: ReactionEvent } => {
   const payload = decodeMessagePayload(plaintext);
-  const clientMessageId =
-    'client_message_id' in message ? message.client_message_id : message.message_id;
+  const clientMessageId = message.client_message_id;
   const serverMessageId = message.message_id;
   const sentAt = message.sent_at ?? new Date().toISOString();
 
@@ -203,6 +202,46 @@ export const resolveEnvelope = (
       state: serverMessageId ? 'sent' : 'sending',
     },
   };
+};
+
+/**
+ * Reconcile the server's echo of a message we sent.
+ *
+ * A sender cannot decrypt their own ciphertext: the ratchet encrypts to the recipient's
+ * chain, not their own. So the echo is never decrypted -- it only confirms the message
+ * landed and carries the server's authoritative id and timestamp. Without this the echo
+ * would arrive as an undecryptable payload and replace the optimistic bubble with a
+ * failure.
+ */
+export const acknowledgeMessage = (
+  previousMessages: DisplayMessage[],
+  clientMessageId: string,
+  serverMessageId: string | undefined,
+  sentAt: string,
+): DisplayMessage[] => {
+  const index = previousMessages.findIndex(
+    (message) => message.clientMessageId === clientMessageId,
+  );
+
+  // An echo with no local copy comes from another tab or device. There is nothing to
+  // reconcile and nothing we can decrypt, so leave the timeline alone.
+  if (index === -1) {
+    return previousMessages;
+  }
+
+  return previousMessages
+    .map((message, position) =>
+      position === index
+        ? {
+            ...message,
+            id: serverMessageId ?? message.id,
+            serverMessageId,
+            sentAt,
+            state: 'sent' as const,
+          }
+        : message,
+    )
+    .sort((left, right) => compareSentAt(left.sentAt, right.sentAt));
 };
 
 export const mergeReactions = (
