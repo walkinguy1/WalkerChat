@@ -4,8 +4,18 @@ export type ChatMessageEvent = {
   client_message_id: string;
   message_id?: string;
   sender_id: string;
-  target_id: string;
-  ciphertext: string;
+  /** This installation's id, as published. */
+  sender_device_id?: string;
+  /** Server-resolved device row; receivers key their ratchet session on it. */
+  sender_device_row_id?: string | null;
+  target_id?: string;
+  /**
+   * One ciphertext per recipient device, keyed by device row id. A pairwise ratchet
+   * encrypts to a single device's chain, so a two-device recipient needs two
+   * ciphertexts. Group messages use the single "*" key, because Sender Keys produce
+   * one ciphertext for the whole membership.
+   */
+  envelopes: Record<string, string>;
   is_media?: boolean;
   sent_at?: string;
 };
@@ -93,10 +103,14 @@ export type ChatMessageRecord = {
   message_id: string;
   chat_id: string;
   sender_id: string;
+  /** Which installation sent it; the receiver keys its ratchet session on this. */
+  sender_device_row_id: string | null;
+  /** The one envelope addressed to this device. */
   ciphertext: string;
   status: string;
   is_media: boolean;
   sent_at: string;
+  client_message_id: string;
 };
 
 export type TypingEvent = {
@@ -105,6 +119,24 @@ export type TypingEvent = {
   sender_id: string;
   target_id: string;
   is_typing: boolean;
+  sent_at?: string;
+};
+
+/**
+ * A sender key distribution for a group, addressed to one member.
+ *
+ * Encrypted with the pairwise session between sender and target, so the server relays
+ * bytes it cannot read, and never stores it.
+ */
+export type SenderKeyEvent = {
+  type: 'sender_key';
+  chat_id: string;
+  sender_id: string;
+  sender_device_id?: string;
+  /** Server-resolved, so the recipient keys its session on a verified value. */
+  sender_device_row_id?: string | null;
+  target_id: string;
+  ciphertext: string;
   sent_at?: string;
 };
 
@@ -146,6 +178,7 @@ export type RealtimeEvent =
   | ChatMessageEvent
   | TypingEvent
   | PresenceEvent
+  | SenderKeyEvent
   | WebRtcSignalEvent
   | ErrorEvent;
 
