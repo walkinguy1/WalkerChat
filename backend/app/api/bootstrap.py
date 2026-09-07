@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api", tags=["bootstrap"])
 
 @router.get("/bootstrap", response_model=BootstrapResponse)
 async def fetch_bootstrap(
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> BootstrapResponse:
-    return await get_bootstrap_data(session)
+    return await get_bootstrap_data(session, current_user)

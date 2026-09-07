@@ -5,19 +5,26 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
+from sqlalchemy import select
+
 from app.core.database import SessionLocal
 from app.core.rate_limiter import WebSocketRateLimiter
 from app.core.security import get_ws_user
 from app.core.ws_manager import manager
+from app.models import Device
 from app.schemas.chat import (
     ChatMessageEvent,
     ErrorEvent,
+    SenderKeyEvent,
     TypingEvent,
     WebRTCSignalEvent,
     realtime_event_adapter,
 )
 from app.services.chat import (
     build_presence_events,
+    chat_member_ids,
+    ensure_directed_delivery_allowed,
+    envelopes_for_message,
     persist_chat_message,
     set_presence_state,
     validate_typing_event,
@@ -59,7 +66,10 @@ async def websocket_endpoint(
             )
 
         for presence_event in presence_events:
-            await manager.publish(presence_event.model_dump(mode="json"))
+            await manager.publish(
+                presence_event.model_dump(mode="json"),
+                {str(presence_event.target_id)},
+            )
 
     try:
         while True:
@@ -102,13 +112,31 @@ async def websocket_endpoint(
                         )
                         continue
 
+                    # Everyone in the chat, sender included: the echo carries the
+                    # server-assigned id back so the sender can mark it delivered.
+                    recipients = await chat_member_ids(session, event.chat_id)
+                    # Re-read from storage so a resend echoes the envelopes actually
+                    # stored, not whatever the duplicate attempt carried.
+                    envelopes = await envelopes_for_message(session, stored_message.id)
+
                 outbound_event = event.model_copy(
                     update={
-                        "message_id": stored_message.message_id,
+                        "message_id": stored_message.id,
                         "sent_at": stored_message.sent_at,
+                        "envelopes": envelopes,
+                        # Server-resolved, not taken from the sender's claim: receivers
+                        # key their ratchet session on it.
+                        "sender_device_row_id": (
+                            str(stored_message.sender_device_id)
+                            if stored_message.sender_device_id
+                            else None
+                        ),
                     }
                 )
-                await manager.publish(outbound_event.model_dump(mode="json"))
+                # Every device receives the whole envelope set and picks out its own.
+                # One event beats one per device, and the extra bytes are ciphertext
+                # the other devices cannot read anyway.
+                await manager.publish(outbound_event.model_dump(mode="json"), recipients)
                 continue
 
             if isinstance(event, TypingEvent):
@@ -125,7 +153,49 @@ async def websocket_endpoint(
                         )
                         continue
 
-                await manager.publish(event.model_dump(mode="json"))
+                    recipients = await chat_member_ids(session, event.chat_id)
+
+                # Echoing your own typing state back is noise.
+                recipients.discard(user_id_str)
+                await manager.publish(event.model_dump(mode="json"), recipients)
+                continue
+
+            if isinstance(event, SenderKeyEvent):
+                # Group key setup, addressed to one member. Relayed, never stored: the
+                # payload is key material, and the server has no reason to keep it.
+                async with SessionLocal() as session:
+                    try:
+                        await ensure_directed_delivery_allowed(
+                            session,
+                            chat_id=event.chat_id,
+                            sender_id=event.sender_id,
+                            target_id=event.target_id,
+                        )
+                    except PermissionError as exc:
+                        await manager.send_to_socket(
+                            websocket, ErrorEvent(detail=str(exc)).model_dump()
+                        )
+                        continue
+
+                    sender_device = None
+                    if event.sender_device_id:
+                        sender_device = await session.scalar(
+                            select(Device).where(
+                                Device.user_id == event.sender_id,
+                                Device.device_id == event.sender_device_id,
+                            )
+                        )
+
+                outbound = event.model_copy(
+                    update={
+                        "sender_device_row_id": (
+                            str(sender_device.id) if sender_device else None
+                        )
+                    }
+                )
+                await manager.publish(
+                    outbound.model_dump(mode="json"), {str(event.target_id)}
+                )
                 continue
 
             if isinstance(event, WebRTCSignalEvent):
@@ -140,10 +210,12 @@ async def websocket_endpoint(
                         )
                         continue
 
-                await manager.publish(event.model_dump(mode="json"))
+                await manager.publish(
+                    event.model_dump(mode="json"), {str(event.target_id)}
+                )
                 continue
 
-            await manager.publish(event.model_dump(mode="json"))
+            await manager.publish(event.model_dump(mode="json"), {user_id_str})
     except WebSocketDisconnect:
         is_last_connection = manager.disconnect(websocket, user_id_str)
         if is_last_connection:
@@ -154,4 +226,7 @@ async def websocket_endpoint(
                 )
 
             for presence_event in presence_events:
-                await manager.publish(presence_event.model_dump(mode="json"))
+                await manager.publish(
+                    presence_event.model_dump(mode="json"),
+                    {str(presence_event.target_id)},
+                )
