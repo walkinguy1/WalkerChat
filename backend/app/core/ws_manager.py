@@ -84,35 +84,37 @@ class ConnectionManager:
         for socket in disconnected:
             self.disconnect(socket, user_id)
 
-    async def publish(self, event: dict[str, Any]) -> None:
+    async def publish(self, event: dict[str, Any], recipients: set[str]) -> None:
+        """
+        Fan an event out to an explicit recipient set.
+
+        Recipients are resolved by the caller, which has database access, and travel in
+        the Redis envelope rather than inside the event. Previously routing was derived
+        from a single ``target_id`` field, which made a group message physically
+        undeliverable: only one member could ever receive it.
+        """
+        if not recipients:
+            return
+
         if self.redis is None:
-            await self.route_event(event)
+            await self.route_event(event, recipients)
             return
 
         await self.redis.publish(
             settings.websocket_channel,
-            json.dumps({"instance_id": self.instance_id, "event": event}, default=str),
+            json.dumps(
+                {
+                    "instance_id": self.instance_id,
+                    "recipients": sorted(recipients),
+                    "event": event,
+                },
+                default=str,
+            ),
         )
 
-    async def route_event(self, event: dict[str, Any]) -> None:
-        event_type = event.get("type")
-        recipients = self._resolve_recipients(event_type=event_type, event=event)
+    async def route_event(self, event: dict[str, Any], recipients: set[str]) -> None:
         for user_id in recipients:
             await self.send_personal_message(event, user_id)
-
-    def _resolve_recipients(self, *, event_type: str | None, event: dict[str, Any]) -> set[str]:
-        recipients: set[str] = set()
-
-        target_id = event.get("target_id")
-        if isinstance(target_id, str):
-            recipients.add(target_id)
-
-        if event_type == "chat_message":
-            sender_id = event.get("sender_id")
-            if isinstance(sender_id, str):
-                recipients.add(sender_id)
-
-        return recipients
 
     async def _listen_for_pubsub(self) -> None:
         if self.redis is None:
@@ -133,8 +135,11 @@ class ConnectionManager:
                     continue
 
                 event = payload.get("event")
-                if isinstance(event, dict):
-                    await self.route_event(event)
+                recipients = payload.get("recipients")
+                if isinstance(event, dict) and isinstance(recipients, list):
+                    await self.route_event(
+                        event, {str(user_id) for user_id in recipients}
+                    )
         except asyncio.CancelledError:
             raise
         finally:
