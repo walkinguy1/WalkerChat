@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import clsx from 'clsx';
-import { Hash, LogOut, Search, ShieldCheck, Users, X } from 'lucide-react';
+import { Hash, LogOut, Plus, Search, ShieldCheck, Users, X } from 'lucide-react';
 import { Avatar } from './ui/Avatar';
 import { Logo } from './ui/Logo';
 import { IconButton } from './ui/Button';
@@ -26,6 +26,7 @@ interface SidebarProps {
   isSocketOpen: boolean;
   onSelectChat: (chatId: string) => void;
   onOpenSearch: () => void;
+  onNewChat: () => void;
   onSignOut: () => void;
   onClose: () => void;
 }
@@ -45,6 +46,7 @@ export const Sidebar = ({
   isSocketOpen,
   onSelectChat,
   onOpenSearch,
+  onNewChat,
   onSignOut,
   onClose,
 }: SidebarProps) => {
@@ -153,11 +155,11 @@ export const Sidebar = ({
       {/* Search opens the command palette — one search for threads, people and
           decrypted message text, rather than a second filter that only sees
           conversation names. */}
-      <div className="flex-shrink-0 px-3 pt-3 pb-2">
+      <div className="flex flex-shrink-0 items-center gap-2 px-3 pt-3 pb-2">
         <button
           type="button"
           onClick={onOpenSearch}
-          className="relative flex h-10 w-full items-center gap-2.5 rounded-field border border-line bg-sunken pr-2.5 pl-3 text-left text-sm text-ink-subtle transition-colors hover:border-line-strong"
+          className="relative flex h-10 flex-1 items-center gap-2.5 rounded-field border border-line bg-sunken pr-2.5 pl-3 text-left text-sm text-ink-subtle transition-colors hover:border-line-strong"
         >
           <Search className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
           <span className="flex-1 truncate">Search everything</span>
@@ -165,6 +167,10 @@ export const Sidebar = ({
             ⌘K
           </kbd>
         </button>
+
+        <IconButton size="md" label="New conversation" variant="secondary" onClick={onNewChat}>
+          <Plus className="h-4 w-4" aria-hidden="true" />
+        </IconButton>
       </div>
 
       {/* Conversation list */}
