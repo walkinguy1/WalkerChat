@@ -1,5 +1,5 @@
 import type { BootstrapResponse, ChatHistoryResponse } from '../types/chat';
-import type { EncodedPreKeyBundle, PublishablePreKeys } from './crypto/session';
+import type { EncodedDeviceBundles, PublishablePreKeys } from './crypto/session';
 
 type TokenResponse = {
   access_token: string;
@@ -83,8 +83,12 @@ export const fetchHistory = async (
   apiUrl: string,
   chatId: string,
   token: string,
+  deviceId?: string,
 ) => {
-  const response = await fetch(`${apiUrl}/api/chats/${chatId}/messages`, {
+  // History is per device: each message is stored as one envelope per recipient
+  // installation, so which ciphertext comes back depends on who is asking.
+  const query = deviceId ? `?device_id=${encodeURIComponent(deviceId)}` : '';
+  const response = await fetch(`${apiUrl}/api/chats/${chatId}/messages${query}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!response.ok) {
@@ -104,7 +108,7 @@ export const claimPrekeyBundle = async (
   apiUrl: string,
   targetUserId: string,
   token: string,
-): Promise<EncodedPreKeyBundle> => {
+): Promise<EncodedDeviceBundles> => {
   const response = await fetch(`${apiUrl}/api/keys/${targetUserId}/bundle`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
@@ -114,7 +118,7 @@ export const claimPrekeyBundle = async (
       await readErrorMessage(response, `Prekey bundle request failed with status ${response.status}`),
     );
   }
-  return (await response.json()) as EncodedPreKeyBundle;
+  return (await response.json()) as EncodedDeviceBundles;
 };
 
 export type MediaUploadResponse = {
@@ -200,7 +204,7 @@ export const publishKeys = async (
   apiUrl: string,
   token: string,
   keys: PublishablePreKeys,
-): Promise<{ identity_changed: boolean; one_time_prekeys_stored: number }> => {
+): Promise<{ device_row_id: string; identity_changed: boolean; one_time_prekeys_stored: number }> => {
   const response = await fetch(`${apiUrl}/api/keys/publish`, {
     method: 'POST',
     headers: {
@@ -208,6 +212,7 @@ export const publishKeys = async (
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
+      device_id: keys.deviceId,
       identity_key: keys.identityKey,
       signed_prekey: {
         key_id: keys.signedPreKey.keyId,
@@ -227,7 +232,11 @@ export const publishKeys = async (
     );
   }
 
-  return (await response.json()) as { identity_changed: boolean; one_time_prekeys_stored: number };
+  return (await response.json()) as {
+    device_row_id: string;
+    identity_changed: boolean;
+    one_time_prekeys_stored: number;
+  };
 };
 
 export type PrekeyCount = {
@@ -237,10 +246,17 @@ export type PrekeyCount = {
 };
 
 /** How many one-time prekeys the server still holds for us. */
-export const fetchPrekeyCount = async (apiUrl: string, token: string): Promise<PrekeyCount> => {
-  const response = await fetch(`${apiUrl}/api/keys/opks/count`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export const fetchPrekeyCount = async (
+  apiUrl: string,
+  token: string,
+  deviceId: string,
+): Promise<PrekeyCount> => {
+  const response = await fetch(
+    `${apiUrl}/api/keys/opks/count?device_id=${encodeURIComponent(deviceId)}`,
+    {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  );
   if (!response.ok) {
     throw new Error(
       await readErrorMessage(response, `Prekey count failed with status ${response.status}`),
@@ -253,6 +269,7 @@ export const fetchPrekeyCount = async (apiUrl: string, token: string): Promise<P
 export const uploadOneTimePreKeys = async (
   apiUrl: string,
   token: string,
+  deviceId: string,
   preKeys: { keyId: string; publicKey: string }[],
 ): Promise<void> => {
   if (preKeys.length === 0) {
@@ -266,6 +283,7 @@ export const uploadOneTimePreKeys = async (
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({
+      device_id: deviceId,
       prekeys: preKeys.map((preKey) => ({
         key_id: preKey.keyId,
         public_key: preKey.publicKey,
@@ -278,4 +296,112 @@ export const uploadOneTimePreKeys = async (
       await readErrorMessage(response, `Prekey upload failed with status ${response.status}`),
     );
   }
+};
+
+export type UserProfile = {
+  id: string;
+  username: string;
+  display_name: string;
+  initials: string;
+  presence_state: 'online' | 'offline';
+};
+
+/** Username-prefix search, so a user can find someone to start a chat with. */
+export const searchUsers = async (
+  apiUrl: string,
+  token: string,
+  query: string,
+): Promise<UserProfile[]> => {
+  const response = await fetch(
+    `${apiUrl}/api/chats/users/search?query=${encodeURIComponent(query)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `User search failed with status ${response.status}`),
+    );
+  }
+  return (await response.json()) as UserProfile[];
+};
+
+/** Create a direct or group chat. Direct chats are deduplicated server-side. */
+export const createChat = async (
+  apiUrl: string,
+  token: string,
+  body: { type: 'DIRECT' | 'GROUP'; name?: string; member_ids: string[] },
+): Promise<{ chat_id: string; type: string }> => {
+  const response = await fetch(`${apiUrl}/api/chats`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Chat creation failed with status ${response.status}`),
+    );
+  }
+
+  return (await response.json()) as { chat_id: string; type: string };
+};
+
+/**
+ * Remove someone from a group.
+ *
+ * The response flags that sender keys must be rotated: removal alone does not stop the
+ * departing member reading future messages, because they keep the chain keys they were
+ * already given.
+ */
+export const removeChatMember = async (
+  apiUrl: string,
+  token: string,
+  chatId: string,
+  userId: string,
+): Promise<{ sender_key_rotation_required: boolean }> => {
+  const response = await fetch(`${apiUrl}/api/chats/${chatId}/members/${userId}`, {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Member removal failed with status ${response.status}`),
+    );
+  }
+
+  return (await response.json()) as { sender_key_rotation_required: boolean };
+};
+
+export type DeviceSummary = {
+  device_row_id: string;
+  device_id: string;
+  display_name: string | null;
+  identity_key: string;
+  created_at: string | null;
+  last_seen_at: string | null;
+};
+
+/**
+ * Every device belonging to a user.
+ *
+ * Senders need this to know how many copies of a message to produce, and safety
+ * numbers are computed over the whole set.
+ */
+export const fetchDevices = async (
+  apiUrl: string,
+  userId: string,
+  token: string,
+): Promise<DeviceSummary[]> => {
+  const response = await fetch(`${apiUrl}/api/keys/${userId}/devices`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new Error(
+      await readErrorMessage(response, `Device list failed with status ${response.status}`),
+    );
+  }
+  return (await response.json()) as DeviceSummary[];
 };
