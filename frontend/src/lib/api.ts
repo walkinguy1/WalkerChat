@@ -5,7 +5,22 @@ type TokenResponse = {
   access_token: string;
   token_type: string;
   user_id: string;
+  username?: string | null;
+  display_name?: string | null;
 };
+
+export type WalkerChatTokenResponse = TokenResponse;
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
 
 type WebSocketTicketResponse = {
   ticket: string;
@@ -20,6 +35,56 @@ const readErrorMessage = async (response: Response, fallback: string) => {
     return fallback;
   }
 };
+
+const authRequest = async (
+  apiUrl: string,
+  path: string,
+  supabaseAccessToken: string,
+  body?: Record<string, string>,
+): Promise<TokenResponse> => {
+  const response = await fetch(`${apiUrl}${path}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${supabaseAccessToken}`,
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (!response.ok) {
+    const fallback = `Authentication failed with status ${response.status}`;
+    let message = fallback;
+    let code: string | undefined;
+    try {
+      const payload = (await response.json()) as {
+        detail?: string | { code?: string; message?: string };
+      };
+      if (typeof payload.detail === 'string') message = payload.detail;
+      else if (payload.detail) {
+        message = payload.detail.message ?? fallback;
+        code = payload.detail.code;
+      }
+    } catch {
+      // Use the generic response message when the server returned no JSON body.
+    }
+    throw new ApiError(message, response.status, code);
+  }
+  return (await response.json()) as TokenResponse;
+};
+
+export const exchangeSupabaseSession = (apiUrl: string, accessToken: string) =>
+  authRequest(apiUrl, '/api/auth/supabase/exchange', accessToken);
+
+export const onboardSupabaseAccount = (
+  apiUrl: string,
+  accessToken: string,
+  profile: { username: string; display_name: string },
+) => authRequest(apiUrl, '/api/auth/supabase/onboard', accessToken, profile);
+
+export const linkExistingAccount = (
+  apiUrl: string,
+  accessToken: string,
+  credentials: { username: string; password: string },
+) => authRequest(apiUrl, '/api/auth/supabase/link-existing', accessToken, credentials);
 
 export const login = async (
   apiUrl: string,
