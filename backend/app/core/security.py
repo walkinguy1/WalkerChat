@@ -5,6 +5,7 @@ import jwt
 from fastapi import Depends, HTTPException, Query, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -30,7 +31,7 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-def create_access_token(user_id: UUID) -> str:
+def create_access_token(user_id: UUID, provider_subject: str | None = None) -> str:
     jti = uuid4().hex
     payload = {
         "sub": str(user_id),
@@ -38,6 +39,8 @@ def create_access_token(user_id: UUID) -> str:
         "exp": datetime.now(UTC) + timedelta(minutes=settings.jwt_expiry_minutes),
         "iat": datetime.now(UTC),
     }
+    if provider_subject is not None:
+        payload["provider_sub"] = provider_subject
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
@@ -112,8 +115,30 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
     session: AsyncSession = Depends(get_db),
 ) -> User:
-    user_id = await _decode_access_token(credentials.credentials)
-    user = await session.get(User, user_id)
+    payload = _decode_token_payload(credentials.credentials)
+    await _assert_token_not_revoked(payload)
+    try:
+        user_id = UUID(payload["sub"])
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token.",
+        ) from exc
+    provider_subject = payload.get("provider_sub")
+    if provider_subject is None:
+        if settings.app_env != "development":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="A Supabase-authenticated session is required.",
+            )
+        user = await session.get(User, user_id)
+    else:
+        user = await session.scalar(
+            select(User).where(
+                User.id == user_id,
+                User.supabase_subject == provider_subject,
+            )
+        )
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
