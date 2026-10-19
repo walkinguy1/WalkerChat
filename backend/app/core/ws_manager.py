@@ -27,6 +27,10 @@ class ConnectionManager:
             self.redis = Redis.from_url(settings.redis_url, decode_responses=True)
             await self.redis.ping()
         except RedisError:
+            if settings.app_env != "development":
+                raise RuntimeError(
+                    "Redis is required for WebSocket fanout outside development."
+                ) from None
             logger.exception(
                 "Redis is unavailable. Continuing with single-process WebSocket delivery."
             )
