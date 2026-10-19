@@ -30,6 +30,11 @@ async def get_runtime_redis() -> Redis | None:
             client = Redis.from_url(settings.redis_url, decode_responses=True)
             await client.ping()
         except RedisError:
+            if settings.app_env != "development":
+                raise RuntimeError(
+                    "Redis is required outside development; ephemeral auth state "
+                    "is unavailable."
+                ) from None
             return None
 
         _redis_client = client
@@ -95,6 +100,22 @@ async def get_ephemeral_value(key: str) -> str | None:
             return None
         stored = _memory_values.get(key)
         return stored if isinstance(stored, str) else None
+
+
+async def consume_ephemeral_value(key: str) -> str | None:
+    """Atomically read and remove a short-lived value such as a WebSocket ticket."""
+    redis_client = await get_runtime_redis()
+    if redis_client is not None:
+        # Redis GETDEL makes ticket consumption single-use across all API processes.
+        return await redis_client.getdel(key)
+
+    loop = asyncio.get_running_loop()
+    async with _memory_lock:
+        expiry = _memory_expirations.pop(key, None)
+        value = _memory_values.pop(key, None)
+        if expiry is None or expiry < loop.time():
+            return None
+        return value if isinstance(value, str) else None
 
 
 async def delete_ephemeral_value(key: str) -> None:

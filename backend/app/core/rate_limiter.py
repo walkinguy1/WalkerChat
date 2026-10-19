@@ -1,4 +1,5 @@
 import time
+import logging
 from collections import defaultdict, deque
 from typing import Dict
 
@@ -8,6 +9,7 @@ from redis.exceptions import RedisError
 from app.core.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 class RedisRateLimiter:
@@ -39,8 +41,10 @@ class RedisRateLimiter:
             
             return True
         except RedisError:
-            # If Redis fails, allow the request (fail open)
-            return True
+            # Rate-limited actions fail closed if Redis becomes unavailable after
+            # startup. Falling back per-request would reset shared counters per worker.
+            logger.warning("Redis failed during WebSocket rate limiting; denying action.")
+            return False
 
 
 class InMemoryRateLimiter:

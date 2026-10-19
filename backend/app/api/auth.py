@@ -83,7 +83,16 @@ async def login(
     user = await session.scalar(
         select(User).where(User.username == body.username)
     )
-    if user is None or not verify_password(body.password, user.password_hash):
+    reserved_demo_user = (
+        settings.app_env != "development"
+        and user is not None
+        and user.id in {settings.demo_alice_id, settings.demo_bob_id}
+    )
+    if (
+        user is None
+        or reserved_demo_user
+        or not verify_password(body.password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password.",

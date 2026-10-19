@@ -5,7 +5,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.runtime_state import get_runtime_value, set_runtime_value
 from app.core.security import hash_password
 from app.models import Chat, ChatMember, ChatType, Device, Message, MessageEnvelope, User
@@ -28,7 +28,6 @@ DEMO_DISPLAY_NAMES = {
 }
 DEMO_CHAT_NAME = "Engineering Sync"
 DEMO_CHAT_SUMMARY = "Encrypted delivery, live presence, and typing signals."
-DEMO_PASSWORD = "walkerchat123"
 
 
 def _naive_utc_now() -> datetime:
@@ -48,52 +47,80 @@ def display_name_for_user(user: User) -> str:
     return DEMO_DISPLAY_NAMES.get(user.id, user.username.replace("_", " ").title())
 
 
-async def seed_demo_data(session: AsyncSession) -> None:
+async def seed_demo_data(
+    session: AsyncSession, config: Settings | None = None
+) -> None:
+    active_settings = config or settings
+    if (
+        active_settings.app_env != "development"
+        or not active_settings.seed_demo_accounts
+    ):
+        raise RuntimeError(
+            "Demo seeding requires APP_ENV=development and "
+            "SEED_DEMO_ACCOUNTS=true."
+        )
+
+    demo_password = active_settings.demo_account_password
+    if not demo_password:
+        # Settings validation should make this unreachable; retain a local guard so
+        # future callers cannot seed a passwordless or default demo account.
+        raise RuntimeError(
+            "DEMO_ACCOUNT_PASSWORD is required when demo seeding is enabled."
+        )
+
     known_user_ids = {
         row[0]
         for row in (
             await session.execute(
                 select(User.id).where(
-                    User.id.in_([settings.demo_alice_id, settings.demo_bob_id])
+                    User.id.in_(
+                        [active_settings.demo_alice_id, active_settings.demo_bob_id]
+                    )
                 )
             )
         ).all()
     }
 
-    if settings.demo_alice_id not in known_user_ids:
+    if active_settings.demo_alice_id not in known_user_ids:
         session.add(
             User(
-                id=settings.demo_alice_id,
+                id=active_settings.demo_alice_id,
                 username="alice",
-                password_hash=hash_password(DEMO_PASSWORD),
+                password_hash=hash_password(demo_password),
             )
         )
 
-    if settings.demo_bob_id not in known_user_ids:
+    if active_settings.demo_bob_id not in known_user_ids:
         session.add(
             User(
-                id=settings.demo_bob_id,
+                id=active_settings.demo_bob_id,
                 username="bob",
-                password_hash=hash_password(DEMO_PASSWORD),
+                password_hash=hash_password(demo_password),
             )
         )
 
     chat_exists = await session.scalar(
-        select(Chat.id).where(Chat.id == settings.demo_chat_id)
+        select(Chat.id).where(Chat.id == active_settings.demo_chat_id)
     )
     if chat_exists is None:
-        session.add(Chat(id=settings.demo_chat_id, type=ChatType.DIRECT))
+        session.add(Chat(id=active_settings.demo_chat_id, type=ChatType.DIRECT))
 
     membership_count = await session.scalar(
         select(func.count())
         .select_from(ChatMember)
-        .where(ChatMember.chat_id == settings.demo_chat_id)
+        .where(ChatMember.chat_id == active_settings.demo_chat_id)
     )
     if membership_count == 0:
         session.add_all(
             [
-                ChatMember(chat_id=settings.demo_chat_id, user_id=settings.demo_alice_id),
-                ChatMember(chat_id=settings.demo_chat_id, user_id=settings.demo_bob_id),
+                ChatMember(
+                    chat_id=active_settings.demo_chat_id,
+                    user_id=active_settings.demo_alice_id,
+                ),
+                ChatMember(
+                    chat_id=active_settings.demo_chat_id,
+                    user_id=active_settings.demo_bob_id,
+                ),
             ]
         )
 
