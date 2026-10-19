@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.runtime_state import (
-    delete_ephemeral_value,
+    consume_ephemeral_value,
     get_ephemeral_value,
     set_ephemeral_value,
 )
@@ -82,46 +82,26 @@ async def revoke_access_token(token: str) -> None:
 
 
 async def create_ws_ticket(user_id: UUID) -> str:
-    from app.core.logging_config import WalkerChatLogger
-    logger = WalkerChatLogger(__name__)
-    
     ticket = uuid4().hex
-    logger.debug(f"Creating WebSocket ticket for user {user_id}: {ticket[:8]}...")
-    
     await set_ephemeral_value(
         f"ws-ticket:{ticket}",
         str(user_id),
         settings.ws_ticket_expiry_seconds,
     )
-    
-    logger.debug(f"WebSocket ticket created and stored: {ticket[:8]}...")
     return ticket
 
 
 async def consume_ws_ticket(ticket: str) -> UUID:
-    from app.core.logging_config import WalkerChatLogger
-    logger = WalkerChatLogger(__name__)
-    
-    logger.debug(f"Attempting to consume WebSocket ticket: {ticket[:8]}...")
-    
-    stored_user_id = await get_ephemeral_value(f"ws-ticket:{ticket}")
-    
+    stored_user_id = await consume_ephemeral_value(f"ws-ticket:{ticket}")
     if stored_user_id is None:
-        logger.warning(f"WebSocket ticket not found: {ticket[:8]}...")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired WebSocket ticket.",
         )
 
-    logger.debug(f"Found user_id for ticket: {stored_user_id}")
-    await delete_ephemeral_value(f"ws-ticket:{ticket}")
-    
     try:
-        user_uuid = UUID(stored_user_id)
-        logger.debug(f"Successfully parsed UUID: {user_uuid}")
-        return user_uuid
+        return UUID(stored_user_id)
     except ValueError as exc:
-        logger.error(f"Failed to parse UUID from stored_user_id: {stored_user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired WebSocket ticket.",
