@@ -23,13 +23,13 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 
 async def verify_database_schema() -> None:
     """
-    Confirm the database has been migrated, rather than creating tables on boot.
+    Confirm that every model table exists, rather than creating tables on boot.
 
     This used to call ``Base.metadata.create_all``, which silently bypassed Alembic --
     the migrations drifted out of sync with the models for a long time without anyone
     noticing, because nothing ever ran them. Failing loudly here means schema problems
-    surface at startup instead of as a 500 on the first request that touches a missing
-    column.
+    that leave a whole table absent surface at startup. This check does not compare
+    columns or verify the recorded Alembic revision; apply migrations before startup.
 
     Run ``alembic upgrade head`` before starting the app.
     """
@@ -41,7 +41,7 @@ async def verify_database_schema() -> None:
     missing = sorted(set(Base.metadata.tables) - set(tables))
     if missing:
         raise RuntimeError(
-            "Database schema is not up to date; missing tables: "
+            "Database is missing required tables: "
             + ", ".join(missing)
             + ". Run 'alembic upgrade head'."
         )
