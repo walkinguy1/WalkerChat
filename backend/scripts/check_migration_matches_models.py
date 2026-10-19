@@ -1,5 +1,5 @@
 """
-Check the Alembic baseline against the SQLAlchemy models.
+Check the checked-in Alembic revision chain against the SQLAlchemy models.
 
 The previous migration drifted badly from the models -- wrong column name on
 ``messages``, missing ``users.password_hash``, two tables absent entirely -- and nobody
@@ -7,8 +7,8 @@ noticed for a long time because ``create_all`` ran at startup and Alembic was ne
 exercised. Now that Alembic is the only thing that builds the schema, that drift would
 be a hard startup failure instead of a silent inconsistency.
 
-This runs without a database: it executes the migration with a recording stub in place
-of ``op`` and diffs the resulting table and column names against ``Base.metadata``.
+This runs without a database: it executes the revision chain with a recording stub in
+place of ``op`` and diffs the resulting table and column names against ``Base.metadata``.
 
 Usage:  python scripts/check_migration_matches_models.py
 """
@@ -26,8 +26,8 @@ import sqlalchemy as sa  # noqa: E402
 
 from app.models import Base  # noqa: E402
 
-MIGRATION = (
-    Path(__file__).resolve().parents[1] / "alembic" / "versions" / "0001_e2ee_baseline.py"
+MIGRATIONS = sorted(
+    (Path(__file__).resolve().parents[1] / "alembic" / "versions").glob("*.py")
 )
 
 
@@ -46,6 +46,15 @@ class RecordingOp:
     def create_index(self, name: str, table: str, *_args: Any, **_kwargs: Any) -> None:
         self.indexes.append((table, name))
 
+    def add_column(self, table: str, column: sa.Column, **_kwargs: Any) -> None:
+        self.tables[table].add(column.name)
+
+    def drop_column(self, table: str, column: str, **_kwargs: Any) -> None:
+        self.tables[table].discard(column)
+
+    def alter_column(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
     def f(self, name: str) -> str:
         return name
 
@@ -57,15 +66,13 @@ class RecordingOp:
 def main() -> int:
     recorder = RecordingOp()
 
-    source = MIGRATION.read_text(encoding="utf-8")
-    namespace: dict[str, Any] = {"context": SimpleNamespace()}
-    exec(compile(source, str(MIGRATION), "exec"), namespace)  # noqa: S102
-
-    # Swap in the recorder *after* executing the module: its own `from alembic import
-    # op` would otherwise overwrite a pre-seeded stub. `upgrade` resolves `op` from the
-    # module globals when called, so replacing it here is enough.
-    namespace["op"] = recorder
-    namespace["upgrade"]()
+    for migration in MIGRATIONS:
+        source = migration.read_text(encoding="utf-8")
+        namespace: dict[str, Any] = {"context": SimpleNamespace()}
+        exec(compile(source, str(migration), "exec"), namespace)  # noqa: S102
+        # `upgrade` resolves `op` from the module globals at call time.
+        namespace["op"] = recorder
+        namespace["upgrade"]()
 
     problems: list[str] = []
 
