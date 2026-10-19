@@ -1,5 +1,13 @@
 # WalkerChat - Complete Technical Architecture Documentation
 
+> **Source status (Phase 1):** This document contains legacy implementation examples.
+> Follow the current source and `docs/implementation/IMPLEMENTATION_STATUS.md` when they
+> disagree. Current startup checks that model tables exist (it does not compare columns
+> or the Alembic revision, and does not call `create_all`), demo seeding and `/test/*`
+> routes are opt-in for development, and WebSocket fanout requires Redis outside
+> development. Several code examples below have not yet been reconciled with the current
+> implementation.
+
 ## 🏗️ System Architecture Overview
 
 WalkerChat is a secure real-time messaging platform built with modern web technologies. This document explains every component, data flow, and interaction in detail.

@@ -13,28 +13,29 @@ Before your first push:
 3. Review `.gitignore` and confirm `node_modules`, local env files, logs, caches, and service data are not being committed.
 
 ## Features
-- End-to-end encryption: X3DH key agreement and the Double Ratchet, implemented against the published Signal specifications
-- Persistent WebSockets using Redis Pub/Sub
+- Signal-inspired end-to-end encryption: X3DH, XEdDSA, Double Ratchet, and Sender Keys
+- WebSockets with Redis Pub/Sub fanout when Redis is available (the development-only
+  in-memory fallback supports one backend process)
 - Encrypted Media Uploads to MinIO (S3-compatible)
 - Group chat with Sender Keys, and multi-device support
 - WebRTC Peer-to-Peer AV signaling
-- Background tasks scaling using Celery
+- A minimal Celery worker scaffold
 
 ## Security Status
 
 - Message bodies are stored as ciphertext, not plaintext, and a payload that fails
   authentication is never rendered as text.
-- X3DH and the Double Ratchet are implemented per the published specifications, giving
-  forward secrecy and post-compromise security. See [docs/CRYPTO.md](docs/CRYPTO.md) for
-  the parameters and two documented deviations.
+- X3DH, XEdDSA, and the Double Ratchet are implemented with documented deviations and
+  limits. This is not a complete Signal Protocol implementation. See
+  [docs/CRYPTO.md](docs/CRYPTO.md) for protocol parameters and security limits.
 - Private keys are sealed at rest under a password-derived key; the server only ever
   holds public key material and ciphertext.
 - Signed prekeys are verified client-side before any key agreement, and identity-key
   changes surface as a safety-number warning.
 
-- Group chat uses Sender Keys, with per-message signatures and rotation on membership
-  change. Multi-device is supported: keys belong to a device, a message is encrypted once
-  per recipient installation, and safety numbers cover the whole device set.
+- Group chat uses signed Sender Keys. Membership removal requires the remaining clients
+  to rotate their keys. Multi-device is supported: keys belong to a device, a message is
+  encrypted once per recipient installation, and safety numbers cover the whole device set.
 
 Still outstanding before this would be production-grade:
 
@@ -44,9 +45,10 @@ Still outstanding before this would be production-grade:
   sender chain key until it is rotated.
 - Removing someone from a group requires the remaining clients to rotate their sender
   keys. The server flags this, but rotation is not yet triggered automatically.
-- The default JWT and object-storage secrets in `.env.example` are placeholders, the
-  seeded demo accounts use a fixed password, and the `/test/*` debug routes are still
-  mounted without authentication.
+- Non-development startup rejects placeholder JWT, database, Redis, CORS, and object
+  storage configuration. Development examples intentionally contain local placeholders.
+- Demo users are not seeded by default; seeding and `/test/*` routes require separate
+  explicit development-only switches.
 
 ## Directory Structure
 - `/backend`: FastAPI (Async), SQLAlchemy, Alembic, Celery.
@@ -60,8 +62,12 @@ If you are new to Docker, follow these simple steps to get the entire project ru
 Make sure [Docker Desktop](https://www.docker.com/products/docker-desktop) is installed and currently running on your system. 
 
 ### 2. Startup the Services
-Open your terminal in this repository folder (where `docker-compose.yml` lives), create `.env` from `.env.example`, then run:
-`docker-compose up --build`
+Open your terminal in this repository folder (where `docker-compose.yml` lives), copy
+`.env.example` to `.env`, then run:
+`docker compose up --build`
+The backend waits for PostgreSQL and Redis, applies the checked-in Alembic migration,
+then starts FastAPI. Startup checks that every model table exists; it does not compare
+columns or the Alembic revision and does not create tables with `create_all`.
 *(This command will download the necessary environments and build the containers. It might take a few minutes the first time.)*
 
 ### 3. Accessing the Apps
@@ -71,5 +77,12 @@ Open your terminal in this repository folder (where `docker-compose.yml` lives),
 
 ### 4. Stopping the Services
 Press `Ctrl+C` in the terminal where it's running, or run:
-`docker-compose down`
-To wipe the DB and media data cleanly, use `docker-compose down -v`.
+`docker compose down`
+
+### Optional local demo data
+
+The local stack starts with no demo accounts. To seed Alice, Bob, and their direct chat,
+set `SEED_DEMO_ACCOUNTS=true` in `.env` and set `DEMO_ACCOUNT_PASSWORD` to a unique,
+local-only value of at least 12 characters. The same configured password is used for the
+two demo accounts. To mount unauthenticated diagnostic endpoints for local debugging,
+also set `ENABLE_TEST_ROUTES=true`. Both switches are rejected outside development.

@@ -17,7 +17,8 @@ cd walkerchat
 cp .env.example .env
 
 # Start all services with Docker
-docker-compose up -d
+docker compose up --build -d
+- `backend/app/api/ws.py`
   WebSocket chat endpoint and realtime event handling
 - `backend/app/core/config.py`
   Central settings
@@ -37,8 +38,12 @@ docker-compose up -d
   Frontend fetch helpers
 - `frontend/src/lib/chat.ts`
   Chat view-model mapping helpers
-- `frontend/src/lib/crypto.ts`
-  Demo encrypted envelope logic
+- `frontend/src/lib/crypto/`
+  X3DH, Double Ratchet, Sender Keys, fingerprints, serialization, and crypto tests
+- `frontend/src/lib/media.ts`
+  Browser-side encrypted image preparation and upload
+- `frontend/src/hooks/useWebRTC.ts` and `frontend/src/components/CallOverlay.tsx`
+  Browser call state and call UI
 - `frontend/src/types/chat.ts`
   Shared frontend types for bootstrap/history/realtime events
 
@@ -47,12 +52,16 @@ docker-compose up -d
 ### Docker path
 
 1. Start Docker Desktop.
-2. Copy `.env.example` to `.env` and replace placeholder passwords.
+2. Copy `.env.example` to `.env`. It contains development placeholders only.
 3. From repo root run:
 
 ```powershell
-docker-compose up --build
+docker compose up --build
 ```
+
+The backend waits for PostgreSQL and Redis, runs `alembic upgrade head`, and then
+starts. Startup checks that all model tables exist; it does not compare columns or the
+Alembic revision, and it does not call `create_all`.
 
 4. Open:
 
@@ -66,19 +75,29 @@ docker-compose up --build
 2. Install `backend/requirements.txt`.
 3. Copy `backend/.env.example` to `backend/.env` or export the variables manually.
 4. Ensure PostgreSQL and Redis are running.
-5. Set:
+5. From `backend/`, apply the checked-in migration before starting the API:
+
+```powershell
+alembic upgrade head
+```
+
+6. Start the API from `backend/`:
+
+```powershell
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The app checks for missing model tables on startup and reports the migration command to
+run. It does not compare columns or the Alembic revision, and it does not create tables
+automatically.
+
+Set these values in `backend/.env` for direct local development:
 
 - `DATABASE_URL`
 - `REDIS_URL`
 - `MINIO_ENDPOINT`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
-
-6. Start:
-
-```powershell
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
 
 ### Local frontend path
 
@@ -95,15 +114,22 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 npm run dev -- --host 0.0.0.0
 ```
 
-## 6. Seeded Demo Identities
+## 6. Optional Seeded Demo Identities
 
-The backend seeds:
+Demo identities are not created by default. For local development only, set
+`SEED_DEMO_ACCOUNTS=true` and set `DEMO_ACCOUNT_PASSWORD` to a unique local-only value
+with at least 12 characters. The same configured password is assigned to these accounts:
 
 - Alice Walker
 - Bob Stone
 - One direct chat: `Engineering Sync`
 
-The frontend uses `/api/bootstrap` to discover them. Do not hardcode identities in new features if the API can provide them.
+Staging and production reject demo seeding, and do not permit these seeded account IDs to
+sign in. The frontend uses authenticated `/api/bootstrap` data to discover accounts.
+Do not hardcode identities in new features when the API can provide them.
+
+The unauthenticated `/test/*` diagnostics are not registered by default. For local
+debugging only, set `ENABLE_TEST_ROUTES=true`; the setting is rejected outside development.
 
 ## 7. Realtime Event Contract
 
@@ -111,6 +137,7 @@ Current WebSocket event types:
 
 - `chat_message`
 - `typing`
+- `sender_key`
 - `webrtc_offer`
 - `webrtc_answer`
 - `webrtc_ice`
@@ -128,20 +155,23 @@ rejects the whole event.
 - Must include `chat_id`
 - Must include `client_message_id`
 - Must include `sender_id`
-- Must include `target_id`
-- Must include `ciphertext`
-- Must include encryption metadata
+- Carries `envelopes`, a map of recipient device-row IDs to ciphertexts; group messages
+  use the `"*"` key for their single Sender Key ciphertext.
+- `target_id` is optional and unused for message routing; the server resolves delivery
+  from chat membership.
 - May include `is_media` (defaults to `false`); set it when the encrypted
   payload carries a photo attachment
 
-Delivered to both the target and the sender, so the sender can reconcile its
-optimistic bubble against the server-assigned `message_id`.
+Delivered to every chat member, including the sender for reconciliation with the
+server-assigned `message_id`. History returns the single envelope for the requesting
+device.
 
 ### Typing event requirements
 
 - Must include `chat_id`
 - Must include `sender_id`
-- Must include `target_id`
+- May include `target_id`; recipients come from chat membership and the sender's own
+  typing event is not echoed back.
 - Must include `is_typing`
 
 ### WebRTC signal requirements
@@ -162,10 +192,11 @@ Delivered to the target only — the caller does not get an echo.
 1. Frontend creates an encrypted envelope.
 2. Frontend sends a `chat_message` event over WebSocket.
 3. Backend validates the payload with Pydantic v2.
-4. Backend verifies both sender and target belong to the chat.
-5. Backend stores only the encrypted payload in PostgreSQL.
+4. Backend verifies the sender belongs to the chat and resolves all chat members.
+5. Backend stores ciphertext envelopes in PostgreSQL.
 6. Backend publishes the event through Redis Pub/Sub.
-7. Active WebSocket sessions receive the event.
+7. Active WebSocket sessions on every instance receive the event. In development only,
+   an in-memory fallback supports one backend process when Redis is unavailable.
 
 ### Presence flow
 
@@ -207,20 +238,16 @@ Delivered to the target only — the caller does not get an echo.
 4. Expose typed API or WebSocket contracts.
 5. Update frontend types and UI.
 
-## 10. How To Replace Demo Crypto With Real Signal Logic
+## 10. Current Cryptography
 
-Current state:
+The frontend already contains X3DH, XEdDSA, Double Ratchet, group Sender Keys, and
+multi-device support under `frontend/src/lib/crypto/`. The server stores opaque message
+envelopes and public device key material. The cryptographic protocol, parameters, tests,
+and deviations are documented in [`docs/CRYPTO.md`](docs/CRYPTO.md).
 
-- `frontend/src/lib/crypto.ts` produces demo ciphertext envelopes
-
-Migration direction:
-
-1. Introduce identity keys, signed prekeys, one-time prekeys, and sessions.
-2. Add backend APIs for bundle publication and retrieval.
-3. Perform X3DH session establishment on the client.
-4. Replace demo envelope generation with Double Ratchet message encryption.
-5. Keep only ciphertext and public key material on the server.
-6. Do not move plaintext handling into backend services.
+The protocol has documented limits, including clear ratchet headers and weaker group
+post-compromise security. Do not describe the implementation as a complete Signal
+Protocol implementation.
 
 ## 11. Calling
 
@@ -228,7 +255,7 @@ Calling is implemented. Media is peer-to-peer via native `RTCPeerConnection`;
 the backend only relays signaling.
 
 - `frontend/src/hooks/useWebRTC.ts` owns the call state machine
-- `frontend/src/components/CallPanel.tsx` is the call UI
+- `frontend/src/components/CallOverlay.tsx` is the call UI
 - Signals ride the existing chat socket at `/api/ws/chat`
 - `GET /api/webrtc/ice-config` returns the STUN/TURN list
 
@@ -280,19 +307,17 @@ Backend syntax check with bundled runtime:
 
 ## 13. Known Limitations
 
-- Signal Protocol is not fully implemented yet
-- Demo data is intentionally seeded for development
-- The current UI is single-thread demo oriented
-- Media upload flow exists as scaffolding only
-- Background worker logic is still minimal
+- WalkerChat implements Signal-inspired X3DH, XEdDSA, Double Ratchet, and Sender Keys,
+  but it is not a complete Signal Protocol implementation; see `docs/CRYPTO.md` for
+  protocol deviations and security limits.
+- Demo accounts are opt-in in development and disabled by default.
+- Encrypted media upload/download is implemented and requires MinIO or compatible S3
+  storage.
+- WebRTC media is peer-to-peer; the backend relays signaling over the existing chat
+  WebSocket.
+- The Celery worker remains a minimal scaffold.
 
 ## 14. Recommended Next Steps
 
-Best next upgrades:
-
-1. Real Signal Protocol key bundle APIs and ratchet state
-2. Auth and per-user session identity
-3. Group chat membership management
-4. Delivery/read receipts persisted in DB
-5. WebRTC calling UI and signaling polish
-6. Media message encryption and MinIO integration
+For verified open work, documentation mismatches, and prerequisites for later phases,
+see [`docs/implementation/IMPLEMENTATION_STATUS.md`](docs/implementation/IMPLEMENTATION_STATUS.md).
