@@ -16,10 +16,10 @@ media storage, change the WebSocket event schema, or modify WebRTC implementatio
 
 | Area | Current entry points and evidence |
 |---|---|
-| Frontend | `frontend/src/main.tsx`, `frontend/src/App.tsx`; React/Vite. Sign-in calls the existing username/password API through `frontend/src/lib/api.ts` and `frontend/src/components/SignIn.tsx`. |
+| Frontend | `frontend/src/main.tsx`, `frontend/src/App.tsx`; React/Vite. `frontend/src/lib/auth.ts` adapts Supabase Auth/Google PKCE sessions; `frontend/src/lib/api.ts` exchanges verified provider sessions for WalkerChat API tokens. `SignIn.tsx`, `AuthOnboarding.tsx`, and `VaultUnlock.tsx` handle login, profile setup, and local vault unlock separately. |
 | Backend | `backend/app/main.py` creates the FastAPI app and lifespan; routers live in `backend/app/api/`, models in `backend/app/models/`, and business logic in `backend/app/services/`. Endpoints are async. |
-| PostgreSQL and migrations | SQLAlchemy models in `backend/app/models/`; the checked-in migration is `backend/alembic/versions/0001_e2ee_baseline.py`. `backend/alembic/env.py` takes the database URL from validated app settings. `backend/app/core/database.py` checks for missing model tables at startup. `backend/scripts/check_migration_matches_models.py` compares baseline table and column names without a database. |
-| Authentication | `backend/app/api/auth.py` implements register, login, logout, and WebSocket-ticket endpoints. `backend/app/core/security.py` handles password hashing, JWTs, revocation, and ticket authentication. `backend/app/core/rate_limit.py` limits auth and prekey-claim requests. |
+| PostgreSQL and migrations | SQLAlchemy models in `backend/app/models/`; migrations are `0001_e2ee_baseline.py` and `0002_supabase_identity.py`. The second migration preserves existing `users.id` values and adds nullable Supabase identity/profile fields. `backend/alembic/env.py` takes the database URL from validated app settings. `backend/app/core/database.py` checks for missing model tables at startup. `backend/scripts/check_migration_matches_models.py` compares migration-chain table/column names without a database. |
+| Authentication | `backend/app/api/auth.py` implements development-only username/password auth, Supabase onboarding/session exchange, explicit dual-proof legacy account linking, logout, and WebSocket-ticket issuance. `backend/app/core/supabase_auth.py` verifies Supabase access tokens; `backend/app/core/security.py` maps internal JWTs to local users and handles revocation/tickets. `backend/app/core/rate_limit.py` limits auth and prekey-claim requests. |
 | WebSockets | `backend/app/api/ws.py` handles `/api/ws/chat`; `backend/app/schemas/chat.py` defines the realtime contract; `backend/app/core/ws_manager.py` tracks sockets and uses Redis Pub/Sub; `backend/app/core/runtime_state.py` stores tickets, revocations, and counters. Message routing follows chat membership. |
 | Cryptography | `frontend/src/lib/crypto/` contains X3DH, XEdDSA, Double Ratchet, Sender Keys, fingerprints, and local key storage. The existing crypto and chat tests are under `frontend/src/lib/crypto/__tests__/` and `frontend/src/lib/__tests__/`. `docs/CRYPTO.md` describes protocol details and known limits. |
 | Encrypted media | `frontend/src/lib/media.ts` encrypts/prepares images; `backend/app/api/media.py` checks membership and handles upload/download; `backend/app/core/storage.py` connects to MinIO/S3-compatible storage. The server stores opaque bytes and metadata. |
@@ -123,7 +123,37 @@ were not read, printed, or committed.
 
 ## Phase 2 readiness
 
-**Safe to start Phase 2 implementation.** The local workflow and baseline checks are in
-place, and no Phase 2 feature was started. This is not a production-readiness claim:
-production secrets, service connectivity, and the existing-database migration path still
-need environment-specific review.
+### Phase 2: Supabase Auth and Google sign-in
+
+**Status: IMPLEMENTED; automated checks pass, external provider verification pending.**
+The architecture, setup steps, migration behavior, compatibility notes, test results,
+and remaining limitations are in [phase-02-auth.md](phase-02-auth.md). The backend
+requires a configured Supabase project outside development; the browser exposes only
+the project URL and publishable key. Existing local account data remains in place and
+must be linked by proving both the legacy password and Google identity.
+
+| Check | Result |
+|---|---|
+| `npm test -- --run` in `frontend/` | Passed: 11 files, 176 tests. The sandboxed run could not rename Vitest temp cache files; rerun outside the sandbox passed. |
+| `npm run build` | Passed. Vite noted Browserslist data is about six months old. |
+| `npm run lint` | Passed. |
+| `npm audit --json` / `npm audit --omit=dev --json` | Both passed with 0 reported vulnerabilities. |
+| `python -m pytest -q` in `backend/` | Passed: 40 tests in 3.95 seconds, using mocks/fakes. |
+| `python -m compileall -q app alembic tests` | Passed. |
+| Backend import (`import app.main`) | Passed from `backend/`. |
+| `python scripts/check_migration_matches_models.py` | Passed: 8 tables, 49 columns. |
+| `alembic upgrade head --sql` | Passed: offline SQL generated for both revisions; no database connection was made. |
+
+#### Remaining Phase 2 verification and prerequisites
+
+- No Supabase project or Google OAuth client settings were provided. The dashboard
+  setup and real browser OAuth/callback/onboarding/returning-session flow have not been
+  verified. Do not claim production OAuth readiness until that manual test passes.
+- No live PostgreSQL migration, Redis, MinIO, production deployment, or provider-backed
+  integration test was run. Apply the forward migration only after reviewing its SQL
+  and the target database's current Alembic state; preserve a verified backup.
+- Internal WalkerChat API tokens remain valid until expiry or explicit logout/revocation
+  (60 minutes by default). Supabase session validity is checked during token exchange;
+  immediate provider revocation does not invalidate an already-issued internal token.
+- The local crypto vault remains browser/username scoped. Cross-device recovery,
+  key-envelope design, and account recovery are Phase 3 work.
