@@ -44,7 +44,13 @@ def build_initials(display_name: str) -> str:
 
 
 def display_name_for_user(user: User) -> str:
-    return DEMO_DISPLAY_NAMES.get(user.id, user.username.replace("_", " ").title())
+    if user.display_name:
+        return user.display_name
+    if settings.app_env == "development":
+        return DEMO_DISPLAY_NAMES.get(
+            user.id, user.username.replace("_", " ").title()
+        )
+    return user.username.replace("_", " ").title()
 
 
 async def seed_demo_data(
