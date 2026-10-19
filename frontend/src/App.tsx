@@ -39,7 +39,7 @@ import { clearSearchIndex, indexChatMessages } from './lib/search';
 import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useWebRTC, type OutboundSignal } from './hooks/useWebRTC';
-import { SignIn, type DemoAccount } from './components/SignIn';
+import { SignIn } from './components/SignIn';
 import { Sidebar, type ConversationSummary } from './components/Sidebar';
 import { ChatHeader } from './components/ChatHeader';
 import { MessageList, type HistoryState } from './components/MessageList';
@@ -70,23 +70,6 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [{ urls: ['stun:stun.l.google.com:19
 
 const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 const wsBaseUrl = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
-
-const demoAccounts: readonly DemoAccount[] = [
-  {
-    username: 'alice',
-    password: 'walkerchat123',
-    displayName: 'Alice Walker',
-    initials: 'AW',
-    role: 'Field lead',
-  },
-  {
-    username: 'bob',
-    password: 'walkerchat123',
-    displayName: 'Bob Stone',
-    initials: 'BS',
-    role: 'Operations',
-  },
-];
 
 const App = () => {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
@@ -685,8 +668,8 @@ const App = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const handleSignIn = async (account: DemoAccount) => {
-    setSigningInUsername(account.username);
+  const handleSignIn = async (username: string, password: string) => {
+    setSigningInUsername(username);
     clearToasts();
 
     try {
@@ -704,12 +687,12 @@ const App = () => {
       setCryptoStore(null);
       setWsTicket(null);
 
-      const tokenData = await login(apiUrl, account.username, account.password);
+      const tokenData = await login(apiUrl, username, password);
 
       // The account password unlocks the local key vault. Private keys are sealed at
       // rest, so signing in is what makes them readable again.
-      const store = await CryptoStore.unlock(account.password, {
-        databaseName: `walkerchat-crypto-${account.username}`,
+      const store = await CryptoStore.unlock(password, {
+        databaseName: `walkerchat-crypto-${username}`,
       });
 
       const bootstrapped = await bootstrapIdentity(store);
@@ -1100,10 +1083,9 @@ const App = () => {
     return (
       <>
         <SignIn
-          accounts={demoAccounts}
           pendingUsername={signingInUsername}
           isSigningIn={signingInUsername !== null}
-          onSignIn={(account) => void handleSignIn(account)}
+          onSignIn={(username, password) => void handleSignIn(username, password)}
         />
         <Toaster />
       </>
@@ -1174,9 +1156,6 @@ const App = () => {
       >
         <Sidebar
           currentUser={currentUser}
-          currentUserRole={
-            demoAccounts.find((account) => account.username === currentUser.username)?.role
-          }
           conversations={conversations}
           activeChatId={activeChatId}
           isSocketOpen={isSocketOpen}
