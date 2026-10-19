@@ -196,6 +196,16 @@ export class CryptoStore {
     return deviceId;
   }
 
+  static async hasVault(databaseName?: string): Promise<boolean> {
+    const db = await openDatabase(databaseName);
+    try {
+      const tx = db.transaction(STORE_META, 'readonly');
+      return Boolean(await request(tx.objectStore(STORE_META).get('vault')));
+    } finally {
+      db.close();
+    }
+  }
+
   static async unlock(
     password: string,
     options: { databaseName?: string; iterations?: number } = {},

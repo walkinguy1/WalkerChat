@@ -9,12 +9,24 @@ import {
   fetchDevices,
   fetchPrekeyCount,
   fetchWsTicket,
+  ApiError,
+  exchangeSupabaseSession,
+  onboardSupabaseAccount,
+  linkExistingAccount,
   login,
   logout,
   publishKeys,
   searchUsers,
   uploadOneTimePreKeys,
+  type WalkerChatTokenResponse,
 } from './lib/api';
+import {
+  getSupabaseSession,
+  refreshSupabaseSession,
+  signOutSupabase,
+  startGoogleSignIn,
+  subscribeToSupabaseSession,
+} from './lib/auth';
 import { CryptoStore } from './lib/crypto/store';
 import {
   DecryptionFailure,
@@ -40,6 +52,9 @@ import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useWebRTC, type OutboundSignal } from './hooks/useWebRTC';
 import { SignIn } from './components/SignIn';
+import { AuthOnboarding } from './components/AuthOnboarding';
+import { VaultUnlock } from './components/VaultUnlock';
+import { EmptyWorkspace } from './components/EmptyWorkspace';
 import { Sidebar, type ConversationSummary } from './components/Sidebar';
 import { ChatHeader } from './components/ChatHeader';
 import { MessageList, type HistoryState } from './components/MessageList';
@@ -101,6 +116,16 @@ const App = () => {
   const [deviceRowId, setDeviceRowId] = useState<string | null>(null);
   const [cryptoStore, setCryptoStore] = useState<CryptoStore | null>(null);
   const [signingInUsername, setSigningInUsername] = useState<string | null>(null);
+  const [authFlow, setAuthFlow] = useState<'signed_out' | 'onboarding' | 'vault'>('signed_out');
+  const [pendingTokenData, setPendingTokenData] = useState<WalkerChatTokenResponse | null>(null);
+  const [pendingSupabaseToken, setPendingSupabaseToken] = useState<string | null>(null);
+  const [vaultIsNew, setVaultIsNew] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const processedSupabaseToken = useRef<string | null>(null);
+  const activeApplicationToken = useRef<string | null>(null);
+  const activeApplicationUserId = useRef<string | null>(null);
+  const activeCryptoStore = useRef<CryptoStore | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
@@ -128,6 +153,115 @@ const App = () => {
     () => bootstrap?.users.find((user) => user.id === selectedUserId) ?? null,
     [bootstrap, selectedUserId],
   );
+  useEffect(() => {
+    activeApplicationToken.current = authToken;
+    activeApplicationUserId.current = selectedUserId;
+    activeCryptoStore.current = cryptoStore;
+  }, [authToken, cryptoStore, selectedUserId]);
+
+  useEffect(() => {
+    let active = true;
+    const acceptSession = async (session: Awaited<ReturnType<typeof getSupabaseSession>>) => {
+      if (!active) return;
+      if (!session) {
+        processedSupabaseToken.current = null;
+        const oldToken = activeApplicationToken.current;
+        if (oldToken) void logout(apiUrl, oldToken).catch(() => undefined);
+        activeCryptoStore.current?.close();
+        clearSearchIndex();
+        setAuthToken(null);
+        setPendingTokenData(null);
+        setPendingSupabaseToken(null);
+        setAuthFlow('signed_out');
+        setBootstrap(null);
+        setSelectedUserId(null);
+        setActiveChatId(null);
+        setBootstrapState('signed_out');
+        setCryptoStore(null);
+        setSessionManager(null);
+        setGroupManager(null);
+        setDeviceId(null);
+        setDeviceRowId(null);
+        setWsTicket(null);
+        setMessages([]);
+        setHistoryRecords([]);
+        setReactions([]);
+        setAuthError(null);
+        return;
+      }
+      const accessToken = session.access_token;
+      if (processedSupabaseToken.current === accessToken) return;
+      processedSupabaseToken.current = accessToken;
+      setAuthBusy(true);
+      setAuthError(null);
+      try {
+        const tokenData = await exchangeSupabaseSession(apiUrl, accessToken);
+        if (!active) return;
+        setPendingSupabaseToken(accessToken);
+        if (
+          activeApplicationToken.current &&
+          activeApplicationUserId.current === tokenData.user_id
+        ) {
+          try {
+            await logout(apiUrl, activeApplicationToken.current);
+          } catch {
+            // A session refresh may race with the previous token's expiry.
+          }
+          setAuthToken(tokenData.access_token);
+          return;
+        }
+        activeCryptoStore.current?.close();
+        setCryptoStore(null);
+        setSessionManager(null);
+        setGroupManager(null);
+        setPendingTokenData(tokenData);
+        const vaultName = `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`;
+        setVaultIsNew(!(await CryptoStore.hasVault(vaultName)));
+        setAuthFlow('vault');
+      } catch (error) {
+        if (!active) return;
+        if (error instanceof ApiError && error.status === 404 && error.code === 'identity_not_onboarded') {
+          setPendingSupabaseToken(accessToken);
+          setAuthFlow('onboarding');
+        } else if (error instanceof ApiError && error.status === 401) {
+          try {
+            const refreshed = await refreshSupabaseSession();
+            if (refreshed && refreshed.access_token !== accessToken) {
+              processedSupabaseToken.current = null;
+              await acceptSession(refreshed);
+              return;
+            }
+          } catch {
+            // The safe sign-in error below avoids exposing provider response details.
+          }
+          setAuthError('Your Google session expired. Sign in again to continue.');
+        } else {
+          setAuthError(error instanceof Error ? error.message : 'Unable to restore your sign-in session.');
+        }
+      } finally {
+        if (active) setAuthBusy(false);
+      }
+    };
+
+    const unsubscribe = subscribeToSupabaseSession((session) => void acceptSession(session));
+    void getSupabaseSession()
+      .then((session) => acceptSession(session))
+      .catch((error: unknown) => {
+        if (active) setAuthError(error instanceof Error ? error.message : 'Unable to restore your sign-in session.');
+      });
+
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('error') || url.hash.includes('error=')) {
+      queueMicrotask(() => {
+        if (active) setAuthError('Google sign-in was canceled or could not be completed.');
+      });
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
 
   const activeChat = useMemo(
     () => bootstrap?.chats.find((chat) => chat.id === activeChatId) ?? null,
@@ -668,31 +802,88 @@ const App = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
+  const prepareVault = async (tokenData: WalkerChatTokenResponse) => {
+    setPendingTokenData(tokenData);
+    const vaultName = `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`;
+    setVaultIsNew(!(await CryptoStore.hasVault(vaultName)));
+    setAuthFlow('vault');
+  };
+
   const handleSignIn = async (username: string, password: string) => {
     setSigningInUsername(username);
+    setAuthError(null);
     clearToasts();
 
+    try {
+      const tokenData = await login(apiUrl, username, password);
+      await prepareVault(tokenData);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to sign in.');
+    } finally {
+      setSigningInUsername(null);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      await startGoogleSignIn();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to start Google sign-in.');
+      setAuthBusy(false);
+    }
+  };
+
+  const handleCreateSupabaseAccount = async (profile: { username: string; display_name: string }) => {
+    if (!pendingSupabaseToken) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const tokenData = await onboardSupabaseAccount(apiUrl, pendingSupabaseToken, profile);
+      await prepareVault(tokenData);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to create your account.');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleLinkExistingAccount = async (credentials: { username: string; password: string }) => {
+    if (!pendingSupabaseToken) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const tokenData = await linkExistingAccount(apiUrl, pendingSupabaseToken, credentials);
+      await prepareVault(tokenData);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Unable to link this account.');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleVaultUnlock = async (vaultPassphrase: string) => {
+    if (!pendingTokenData) return;
+    setAuthBusy(true);
+    setAuthError(null);
     try {
       if (authToken) {
         try {
           await logout(apiUrl, authToken);
         } catch {
-          // Ignore stale token logout failures during account switch.
+          // An old account token can expire while switching identities.
         }
       }
-
       cryptoStore?.close();
       setSessionManager(null);
       setGroupManager(null);
       setCryptoStore(null);
       setWsTicket(null);
 
-      const tokenData = await login(apiUrl, username, password);
-
-      // The account password unlocks the local key vault. Private keys are sealed at
-      // rest, so signing in is what makes them readable again.
-      const store = await CryptoStore.unlock(password, {
-        databaseName: `walkerchat-crypto-${username}`,
+      const tokenData = pendingTokenData;
+      const store = await CryptoStore.unlock(vaultPassphrase, {
+        databaseName: `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`,
       });
 
       const bootstrapped = await bootstrapIdentity(store);
@@ -735,23 +926,31 @@ const App = () => {
 
       setAuthToken(tokenData.access_token);
       setSelectedUserId(tokenData.user_id);
+      setPendingTokenData(null);
+      setPendingSupabaseToken(null);
+      setAuthFlow('signed_out');
       setDraft('');
       setTypingUserId(null);
     } catch (error) {
-      console.error('Login failed.', error);
-      pushToast(error instanceof Error ? error.message : 'Login failed.');
+      setAuthError(error instanceof Error ? error.message : 'Unable to unlock your local vault.');
     } finally {
-      setSigningInUsername(null);
+      setAuthBusy(false);
     }
   };
 
   const handleSignOut = async () => {
+    let signOutError: string | null = null;
     try {
       if (authToken) {
         await logout(apiUrl, authToken);
       }
-    } catch (error) {
-      console.error('Logout failed.', error);
+    } catch {
+      signOutError = 'Your local WalkerChat token could not be revoked right now.';
+    }
+    try {
+      await signOutSupabase();
+    } catch {
+      signOutError = 'Google sign-out could not be completed. Please try again.';
     } finally {
       // Locking drops the vault key from memory; the sealed data stays on disk so the
       // conversation survives the next sign-in.
@@ -760,6 +959,10 @@ const App = () => {
       // Decrypted plaintext must not outlive the session it belongs to.
       clearSearchIndex();
       setAuthToken(null);
+      setPendingTokenData(null);
+      setPendingSupabaseToken(null);
+      setAuthFlow('signed_out');
+      setAuthError(signOutError);
       setWsTicket(null);
       setSessionManager(null);
       setGroupManager(null);
@@ -1079,13 +1282,45 @@ const App = () => {
     });
   }, [activeChatId, bootstrap, currentUser, messages, presenceByUserId]);
 
+  if (authFlow === 'onboarding') {
+    return (
+      <>
+        <AuthOnboarding
+          busy={authBusy}
+          error={authError}
+          onCreate={(profile) => void handleCreateSupabaseAccount(profile)}
+          onLinkExisting={(credentials) => void handleLinkExistingAccount(credentials)}
+          onSignOut={() => void handleSignOut()}
+        />
+        <Toaster />
+      </>
+    );
+  }
+
+  if (authFlow === 'vault' && pendingTokenData) {
+    return (
+      <>
+        <VaultUnlock
+          isNewVault={vaultIsNew}
+          busy={authBusy}
+          error={authError}
+          onUnlock={(passphrase) => void handleVaultUnlock(passphrase)}
+          onSignOut={() => void handleSignOut()}
+        />
+        <Toaster />
+      </>
+    );
+  }
+
   if (!authToken || bootstrapState === 'signed_out') {
     return (
       <>
         <SignIn
           pendingUsername={signingInUsername}
-          isSigningIn={signingInUsername !== null}
+          isSigningIn={signingInUsername !== null || authBusy}
           onSignIn={(username, password) => void handleSignIn(username, password)}
+          onGoogleSignIn={() => void handleGoogleSignIn()}
+          error={authError}
         />
         <Toaster />
       </>
@@ -1101,7 +1336,7 @@ const App = () => {
     );
   }
 
-  if (bootstrapState === 'error' || !bootstrap || !currentUser || !activeChat) {
+  if (bootstrapState === 'error' || !bootstrap || !currentUser) {
     return (
       <>
         <div className="flex h-full flex-col items-center justify-center gap-4 px-6 text-center">
@@ -1123,6 +1358,40 @@ const App = () => {
             Back to sign in
           </button>
         </div>
+        <Toaster />
+      </>
+    );
+  }
+
+  if (!activeChat) {
+    return (
+      <>
+        <EmptyWorkspace
+          displayName={currentUser.display_name}
+          onFindPeople={() => setIsNewChatOpen(true)}
+          onSignOut={() => void handleSignOut()}
+        />
+        <NewChatDialog
+          open={isNewChatOpen}
+          onClose={() => setIsNewChatOpen(false)}
+          onSearch={async (query) => (authToken ? searchUsers(apiUrl, authToken, query) : [])}
+          onCreate={async ({ type, name, memberIds }) => {
+            if (!authToken) return;
+            try {
+              const created = await createChat(apiUrl, authToken, {
+                type,
+                name,
+                member_ids: memberIds,
+              });
+              const updated = await fetchBootstrap(apiUrl, authToken);
+              setBootstrap(updated);
+              setActiveChatId(created.chat_id);
+              setIsNewChatOpen(false);
+            } catch (error) {
+              pushToast(error instanceof Error ? error.message : 'Unable to start conversation.');
+            }
+          }}
+        />
         <Toaster />
       </>
     );
