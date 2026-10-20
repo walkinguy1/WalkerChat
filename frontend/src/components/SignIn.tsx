@@ -186,8 +186,8 @@ export const SignIn = ({
 
         <p className="mt-8 flex items-start gap-2.5 rounded-field border border-line bg-panel p-3.5 text-[13px] leading-6 text-ink-muted">
           <Lock className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-signal" aria-hidden="true" />
-          Your identity keypair is generated in this browser and stored locally. Signing out
-          clears the derived session keys.
+          Your identity keypair is generated in this browser and stored in your encrypted local
+          vault. Signing out locks the in-memory keys; encrypted vault data stays on this device.
         </p>
       </div>
     </section>

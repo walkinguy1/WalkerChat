@@ -27,7 +27,12 @@ import {
   startGoogleSignIn,
   subscribeToSupabaseSession,
 } from './lib/auth';
-import { CryptoStore } from './lib/crypto/store';
+import {
+  CryptoStore,
+  accountVaultDatabaseName,
+  legacyVaultDatabaseName as legacyVaultDatabaseNameFor,
+} from './lib/crypto/store';
+import { toBase64, wipe } from './lib/crypto/primitives';
 import {
   DecryptionFailure,
   SessionManager,
@@ -119,6 +124,8 @@ const App = () => {
   const [authFlow, setAuthFlow] = useState<'signed_out' | 'onboarding' | 'vault'>('signed_out');
   const [pendingTokenData, setPendingTokenData] = useState<WalkerChatTokenResponse | null>(null);
   const [pendingSupabaseToken, setPendingSupabaseToken] = useState<string | null>(null);
+  const [vaultDatabaseName, setVaultDatabaseName] = useState('');
+  const [legacyVaultDatabaseName, setLegacyVaultDatabaseName] = useState<string | null>(null);
   const [vaultIsNew, setVaultIsNew] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -126,6 +133,7 @@ const App = () => {
   const activeApplicationToken = useRef<string | null>(null);
   const activeApplicationUserId = useRef<string | null>(null);
   const activeCryptoStore = useRef<CryptoStore | null>(null);
+  const activeSessionManager = useRef<SessionManager | null>(null);
   const [isUploadingPhoto, setIsUploadingPhoto] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<LightboxImage | null>(null);
   const [iceServers, setIceServers] = useState<RTCIceServer[]>(DEFAULT_ICE_SERVERS);
@@ -157,7 +165,8 @@ const App = () => {
     activeApplicationToken.current = authToken;
     activeApplicationUserId.current = selectedUserId;
     activeCryptoStore.current = cryptoStore;
-  }, [authToken, cryptoStore, selectedUserId]);
+    activeSessionManager.current = sessionManager;
+  }, [authToken, cryptoStore, selectedUserId, sessionManager]);
 
   useEffect(() => {
     let active = true;
@@ -167,6 +176,7 @@ const App = () => {
         processedSupabaseToken.current = null;
         const oldToken = activeApplicationToken.current;
         if (oldToken) void logout(apiUrl, oldToken).catch(() => undefined);
+        activeSessionManager.current?.close();
         activeCryptoStore.current?.close();
         clearSearchIndex();
         setAuthToken(null);
@@ -186,6 +196,7 @@ const App = () => {
         setMessages([]);
         setHistoryRecords([]);
         setReactions([]);
+        setLightboxImage(null);
         setAuthError(null);
         return;
       }
@@ -210,13 +221,21 @@ const App = () => {
           setAuthToken(tokenData.access_token);
           return;
         }
+        activeSessionManager.current?.close();
         activeCryptoStore.current?.close();
+        clearSearchIndex();
+        setBootstrap(null);
+        setActiveChatId(null);
+        setMessages([]);
+        setHistoryRecords([]);
+        setReactions([]);
+        setLightboxImage(null);
         setCryptoStore(null);
         setSessionManager(null);
         setGroupManager(null);
         setPendingTokenData(tokenData);
-        const vaultName = `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`;
-        setVaultIsNew(!(await CryptoStore.hasVault(vaultName)));
+        await prepareVault(tokenData);
+        if (!active) return;
         setAuthFlow('vault');
       } catch (error) {
         if (!active) return;
@@ -802,12 +821,19 @@ const App = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const prepareVault = async (tokenData: WalkerChatTokenResponse) => {
+  async function prepareVault(tokenData: WalkerChatTokenResponse) {
     setPendingTokenData(tokenData);
-    const vaultName = `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`;
-    setVaultIsNew(!(await CryptoStore.hasVault(vaultName)));
+    const stableName = accountVaultDatabaseName(tokenData.user_id);
+    const hasStableVault = await CryptoStore.hasVault(stableName);
+    const legacyName = legacyVaultDatabaseNameFor(tokenData.username, tokenData.user_id);
+    const hasLegacyVault = !hasStableVault && legacyName !== stableName
+      ? await CryptoStore.hasVault(legacyName)
+      : false;
+    setVaultDatabaseName(stableName);
+    setLegacyVaultDatabaseName(hasLegacyVault ? legacyName : null);
+    setVaultIsNew(!hasStableVault && !hasLegacyVault);
     setAuthFlow('vault');
-  };
+  }
 
   const handleSignIn = async (username: string, password: string) => {
     setSigningInUsername(username);
@@ -867,14 +893,18 @@ const App = () => {
     if (!pendingTokenData) return;
     setAuthBusy(true);
     setAuthError(null);
+    let openedStore: CryptoStore | null = null;
+    let legacyStore: CryptoStore | null = null;
     try {
-      if (authToken) {
+      if (authToken && authToken !== pendingTokenData.access_token) {
         try {
           await logout(apiUrl, authToken);
         } catch {
           // An old account token can expire while switching identities.
         }
       }
+      activeSessionManager.current?.close();
+      sessionManager?.close();
       cryptoStore?.close();
       setSessionManager(null);
       setGroupManager(null);
@@ -882,10 +912,55 @@ const App = () => {
       setWsTicket(null);
 
       const tokenData = pendingTokenData;
-      const store = await CryptoStore.unlock(vaultPassphrase, {
-        databaseName: `walkerchat-crypto-${tokenData.username ?? tokenData.user_id}`,
-      });
+      if (!vaultDatabaseName) throw new Error('The local vault location is unavailable.');
+      if (legacyVaultDatabaseName) {
+        legacyStore = await CryptoStore.unlock(vaultPassphrase, {
+          databaseName: legacyVaultDatabaseName,
+          deferVaultUpgrade: true,
+        });
+        const legacyIdentity = await legacyStore.loadIdentity();
+        if (!legacyIdentity) {
+          throw new Error('This older vault has no identity key and remains unchanged.');
+        }
+        let matchingDevice: Awaited<ReturnType<typeof fetchDevices>>[number] | undefined;
+        try {
+          const legacyDeviceId = await legacyStore.storedDeviceId();
+          if (!legacyDeviceId) {
+            throw new Error('This older vault has no registered device id and remains unchanged.');
+          }
+          const registeredDevices = await fetchDevices(
+            apiUrl,
+            tokenData.user_id,
+            tokenData.access_token,
+          );
+          matchingDevice = registeredDevices.find(
+            (device) =>
+              device.device_id === legacyDeviceId &&
+              device.identity_key === toBase64(legacyIdentity.publicKey),
+          );
+        } finally {
+          wipe(legacyIdentity.privateKey);
+        }
+        if (!matchingDevice) {
+          throw new Error(
+            'This older vault could not be matched to a device on this WalkerChat account. Its data is untouched. You can start a separate device vault.',
+          );
+        }
+        openedStore = await legacyStore.migrateToAccount(
+          vaultDatabaseName,
+          tokenData.user_id,
+        );
+        legacyStore.close();
+        legacyStore = null;
+      } else {
+        openedStore = await CryptoStore.unlock(vaultPassphrase, {
+          databaseName: vaultDatabaseName,
+          accountId: tokenData.user_id,
+        });
+      }
 
+      const store = openedStore;
+      if (!store) throw new Error('The local vault could not be opened.');
       const bootstrapped = await bootstrapIdentity(store);
       setDeviceId(bootstrapped.deviceId);
 
@@ -931,11 +1006,80 @@ const App = () => {
       setAuthFlow('signed_out');
       setDraft('');
       setTypingUserId(null);
+      openedStore = null;
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : 'Unable to unlock your local vault.');
+      openedStore?.close();
     } finally {
+      legacyStore?.close();
       setAuthBusy(false);
     }
+  };
+
+  const handleStartFreshVault = async () => {
+    if (!vaultDatabaseName) return;
+    if (await CryptoStore.hasVault(vaultDatabaseName)) {
+      setAuthError('A vault already exists in this account namespace. It was left unchanged.');
+      return;
+    }
+    setLegacyVaultDatabaseName(null);
+    setVaultIsNew(true);
+    setAuthError(null);
+  };
+
+  const clearUnlockedClientState = () => {
+    activeSessionManager.current?.close();
+    sessionManager?.close();
+    cryptoStore?.close();
+    activeApplicationToken.current = null;
+    activeApplicationUserId.current = null;
+    activeCryptoStore.current = null;
+    activeSessionManager.current = null;
+    clearToasts();
+    clearSearchIndex();
+    setAuthToken(null);
+    setWsTicket(null);
+    setSessionManager(null);
+    setGroupManager(null);
+    setCryptoStore(null);
+    setDeviceId(null);
+    setDeviceRowId(null);
+    setBootstrap(null);
+    setBootstrapState('signed_out');
+    setSelectedUserId(null);
+    setActiveChatId(null);
+    setMessages([]);
+    setHistoryRecords([]);
+    setReactions([]);
+    setReplyTo(null);
+    setHistoryState('idle');
+    setDraft('');
+    setTypingUserId(null);
+    setLightboxImage(null);
+    setIsNewChatOpen(false);
+    setIsSafetyNumberOpen(false);
+    setIsSearchOpen(false);
+    setIsSidebarOpen(false);
+    setChangedPeerIds(new Set());
+  };
+
+  const handleVaultLock = () => {
+    if (!authToken || !selectedUserId) return;
+    const tokenData: WalkerChatTokenResponse = {
+      access_token: authToken,
+      token_type: 'bearer',
+      user_id: selectedUserId,
+      username: currentUser?.username,
+      display_name: currentUser?.display_name,
+    };
+    clearUnlockedClientState();
+    setPendingTokenData(tokenData);
+    setPendingSupabaseToken(null);
+    setVaultDatabaseName(accountVaultDatabaseName(selectedUserId));
+    setLegacyVaultDatabaseName(null);
+    setVaultIsNew(false);
+    setAuthFlow('vault');
+    setAuthError(null);
   };
 
   const handleSignOut = async () => {
@@ -952,39 +1096,11 @@ const App = () => {
     } catch {
       signOutError = 'Google sign-out could not be completed. Please try again.';
     } finally {
-      // Locking drops the vault key from memory; the sealed data stays on disk so the
-      // conversation survives the next sign-in.
-      cryptoStore?.close();
-      clearToasts();
-      // Decrypted plaintext must not outlive the session it belongs to.
-      clearSearchIndex();
-      setAuthToken(null);
+      clearUnlockedClientState();
       setPendingTokenData(null);
       setPendingSupabaseToken(null);
       setAuthFlow('signed_out');
       setAuthError(signOutError);
-      setWsTicket(null);
-      setSessionManager(null);
-      setGroupManager(null);
-      setCryptoStore(null);
-      setDeviceId(null);
-      setDeviceRowId(null);
-      setChangedPeerIds(new Set());
-      setIsSafetyNumberOpen(false);
-      setIsNewChatOpen(false);
-      setSelectedUserId(null);
-      setActiveChatId(null);
-      setBootstrap(null);
-      setBootstrapState('signed_out');
-      setMessages([]);
-      setReactions([]);
-      setReplyTo(null);
-      setHistoryRecords([]);
-      setHistoryState('idle');
-      setDraft('');
-      setTypingUserId(null);
-      setIsSidebarOpen(false);
-      setIsSearchOpen(false);
     }
   };
 
@@ -1302,9 +1418,11 @@ const App = () => {
       <>
         <VaultUnlock
           isNewVault={vaultIsNew}
+          isLegacyVault={legacyVaultDatabaseName !== null}
           busy={authBusy}
           error={authError}
           onUnlock={(passphrase) => void handleVaultUnlock(passphrase)}
+          onStartFresh={() => void handleStartFreshVault()}
           onSignOut={() => void handleSignOut()}
         />
         <Toaster />
@@ -1369,6 +1487,7 @@ const App = () => {
         <EmptyWorkspace
           displayName={currentUser.display_name}
           onFindPeople={() => setIsNewChatOpen(true)}
+          onLock={handleVaultLock}
           onSignOut={() => void handleSignOut()}
         />
         <NewChatDialog
@@ -1434,6 +1553,7 @@ const App = () => {
           }}
           onOpenSearch={() => setIsSearchOpen(true)}
           onNewChat={() => setIsNewChatOpen(true)}
+          onLock={handleVaultLock}
           onSignOut={() => void handleSignOut()}
           onClose={() => setIsSidebarOpen(false)}
         />
