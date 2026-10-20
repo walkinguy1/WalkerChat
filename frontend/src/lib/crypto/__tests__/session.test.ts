@@ -12,8 +12,11 @@ import {
 import type { IdentityChange } from '../session';
 import { CryptoStore, deleteDatabase } from '../store';
 import { Directory } from './directory';
+import { installWebLocks } from './webLocks';
 
 const TEST_ITERATIONS = 100;
+
+installWebLocks();
 
 let counter = 0;
 

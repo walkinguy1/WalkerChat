@@ -4,23 +4,46 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import { ratchetDecrypt, ratchetEncrypt } from '../doubleRatchet';
 import { fromUtf8, generateKeyPair, utf8 } from '../primitives';
-import { CryptoStore, deleteDatabase, sessionKey } from '../store';
+import { CryptoStore, accountVaultDatabaseName, deleteDatabase, openDatabase, sessionKey } from '../store';
 import {
   createIdentityKeyPair,
   createOneTimePreKeys,
   createSignedPreKey,
 } from '../x3dh';
 import { Client, connectedPair } from './harness';
+import { installWebLocks } from './webLocks';
 
 // PBKDF2 at the production 600k iterations would dominate the suite runtime. The code
 // path is identical; only the cost differs.
 const TEST_ITERATIONS = 100;
+
+installWebLocks();
 
 let databaseCounter = 0;
 let databaseName = '';
 
 const unlock = (password = 'correct horse battery staple'): Promise<CryptoStore> =>
   CryptoStore.unlock(password, { databaseName, iterations: TEST_ITERATIONS });
+
+const writeVaultMeta = async (
+  database: string,
+  update: (vault: Record<string, unknown>) => Record<string, unknown>,
+) => {
+  const db = await openDatabase(database);
+  const tx = db.transaction('meta', 'readwrite');
+  const store = tx.objectStore('meta');
+  const get = store.get('vault');
+  await new Promise<void>((resolve, reject) => {
+    get.onsuccess = () => {
+      store.put(update(get.result as Record<string, unknown>));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    };
+    get.onerror = () => reject(get.error);
+  });
+  db.close();
+};
 
 beforeEach(async () => {
   databaseCounter += 1;
@@ -41,10 +64,10 @@ describe('vault unlocking', () => {
   });
 
   it('rejects the wrong password', async () => {
-    const store = await unlock('right password');
+    const store = await unlock('a sufficiently long vault passphrase');
     store.close();
 
-    await expect(unlock('wrong password')).rejects.toThrow(/Incorrect password/);
+    await expect(unlock('a different long vault passphrase')).rejects.toThrow(/Incorrect passphrase/);
   });
 
   it('refuses to operate once locked', async () => {
@@ -59,6 +82,192 @@ describe('vault unlocking', () => {
     const store = await unlock();
     expect(await store.loadIdentity()).toBeNull();
     store.close();
+  });
+
+  it('binds vaults to an account namespace', async () => {
+    const accountName = accountVaultDatabaseName('account-1');
+    const store = await CryptoStore.unlock('a dedicated long vault passphrase', {
+      databaseName: accountName,
+      accountId: 'account-1',
+      iterations: TEST_ITERATIONS,
+    });
+    store.close();
+    await expect(CryptoStore.unlock('a dedicated long vault passphrase', {
+      databaseName: accountName,
+      accountId: 'account-2',
+      iterations: TEST_ITERATIONS,
+    })).rejects.toThrow(/different WalkerChat account/);
+  });
+
+  it('serializes shared-tab vault operations by resource name', async () => {
+    const store = await unlock();
+    let active = 0;
+    let peak = 0;
+    const task = () => store.withExclusiveLock('test-ratchet', async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await Promise.resolve();
+      active -= 1;
+    });
+    await Promise.all([task(), task()]);
+    expect(peak).toBe(1);
+    store.close();
+  });
+
+  it('atomically consumes a one-time prekey across concurrent requests', async () => {
+    const store = await unlock();
+    const [prekey] = createOneTimePreKeys(1, () => 'single-use');
+    await store.saveOneTimePreKeys([prekey]);
+    const consumed = await Promise.all([
+      store.takeOneTimePreKey('single-use'),
+      store.takeOneTimePreKey('single-use'),
+    ]);
+    expect(consumed.filter(Boolean)).toHaveLength(1);
+    store.close();
+  });
+
+  it('rejects a corrupted verifier and an unknown KDF version', async () => {
+    const store = await unlock();
+    store.close();
+    await writeVaultMeta(databaseName, (vault) => {
+      const verifier = vault.verifier as { iv: Uint8Array; ciphertext: Uint8Array };
+      const ciphertext = verifier.ciphertext.slice();
+      ciphertext[0] ^= 0xff;
+      return { ...vault, verifier: { ...verifier, ciphertext } };
+    });
+    await expect(unlock()).rejects.toThrow(/Incorrect passphrase or damaged local vault/);
+
+    databaseName += '-unknown-kdf';
+    const fresh = await unlock();
+    fresh.close();
+    await writeVaultMeta(databaseName, (vault) => ({ ...vault, kdfVersion: 99 }));
+    await expect(unlock()).rejects.toThrow(/unsupported or damaged format/);
+  });
+
+  it('resumes a legacy verifier upgrade after an interrupted unlock', async () => {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const material = await crypto.subtle.importKey(
+      'raw',
+      utf8('a sufficiently long vault passphrase') as BufferSource,
+      'PBKDF2',
+      false,
+      ['deriveBits'],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: TEST_ITERATIONS, hash: 'SHA-256' },
+      material,
+      256,
+    );
+    const key = new Uint8Array(bits);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const { aeadSeal } = await import('../primitives');
+    const ciphertext = await aeadSeal(key, iv, utf8('walkerchat-vault-v1'), new Uint8Array(0));
+    const db = await openDatabase(databaseName);
+    const tx = db.transaction('meta', 'readwrite');
+    tx.objectStore('meta').put({ id: 'vault', salt, iterations: TEST_ITERATIONS, verifier: { iv, ciphertext } });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    db.close();
+
+    const interrupted = await CryptoStore.unlock('a sufficiently long vault passphrase', {
+      databaseName,
+      deferVaultUpgrade: true,
+    });
+    interrupted.close();
+    const resumed = await unlock('a sufficiently long vault passphrase');
+    await expect(resumed.verifyAllRecords()).resolves.toBeUndefined();
+    resumed.close();
+
+    const upgraded = await openDatabase(databaseName);
+    const upgradedTx = upgraded.transaction('meta', 'readonly');
+    const upgradedVault = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const get = upgradedTx.objectStore('meta').get('vault');
+      get.onsuccess = () => resolve(get.result);
+      get.onerror = () => reject(get.error);
+    });
+    upgraded.close();
+    expect(upgradedVault.vaultVersion).toBe(2);
+    expect(upgradedVault.kdfVersion).toBe(1);
+  });
+
+  it('copies an authenticated vault to the account namespace and keeps its source', async () => {
+    const source = await unlock();
+    const identity = createIdentityKeyPair();
+    await source.saveIdentity(identity);
+    const deviceId = await source.deviceId();
+    const accountId = `account-migration-${databaseCounter}`;
+    const targetName = accountVaultDatabaseName(accountId);
+    const migrated = await source.migrateToAccount(targetName, accountId);
+
+    expect(await migrated.storedDeviceId()).toBe(deviceId);
+    expect((await migrated.loadIdentity())?.privateKey).toEqual(identity.privateKey);
+    await expect(CryptoStore.hasVault(databaseName)).resolves.toBe(true);
+    migrated.close();
+
+    const repeated = await source.migrateToAccount(targetName, accountId);
+    expect((await repeated.loadIdentity())?.publicKey).toEqual(identity.publicKey);
+    repeated.close();
+
+    const reopened = await CryptoStore.unlock('correct horse battery staple', {
+      databaseName: targetName,
+      accountId,
+      iterations: TEST_ITERATIONS,
+    });
+    expect((await reopened.loadIdentity())?.publicKey).toEqual(identity.publicKey);
+    reopened.close();
+    source.close();
+    await deleteDatabase(targetName);
+  });
+
+  it('preserves the source when the migration destination is occupied', async () => {
+    const source = await unlock();
+    const identity = createIdentityKeyPair();
+    await source.saveIdentity(identity);
+    await source.deviceId();
+    const accountId = `occupied-${databaseCounter}`;
+    const targetName = accountVaultDatabaseName(accountId);
+    const occupied = await CryptoStore.unlock('another distinct vault passphrase', {
+      databaseName: targetName,
+      accountId,
+      iterations: TEST_ITERATIONS,
+    });
+    occupied.close();
+    await expect(source.migrateToAccount(targetName, `different-${accountId}`)).rejects.toThrow(/already contains local vault data/);
+    expect((await source.loadIdentity())?.publicKey).toEqual(identity.publicKey);
+    source.close();
+    await deleteDatabase(targetName);
+  });
+
+  it('preserves source records when sealed-record verification fails', async () => {
+    const source = await unlock();
+    await source.saveIdentity(createIdentityKeyPair());
+    await source.deviceId();
+    const db = await openDatabase(databaseName);
+    const tx = db.transaction('identity', 'readwrite');
+    const records = tx.objectStore('identity');
+    const get = records.get('self');
+    await new Promise<void>((resolve, reject) => {
+      get.onsuccess = () => {
+        const record = get.result as { wrapped: { iv: Uint8Array; ciphertext: Uint8Array } };
+        const ciphertext = record.wrapped.ciphertext.slice();
+        ciphertext[0] ^= 0xff;
+        records.put({ ...record, wrapped: { ...record.wrapped, ciphertext } });
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      };
+      get.onerror = () => reject(get.error);
+    });
+    db.close();
+
+    const targetName = accountVaultDatabaseName(`corrupt-target-${databaseCounter}`);
+    await expect(source.migrateToAccount(targetName, `corrupt-target-${databaseCounter}`)).rejects.toThrow();
+    await expect(CryptoStore.hasVault(databaseName)).resolves.toBe(true);
+    source.close();
+    await deleteDatabase(targetName);
   });
 });
 

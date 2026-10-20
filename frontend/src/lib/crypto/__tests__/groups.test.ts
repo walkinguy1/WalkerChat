@@ -7,9 +7,12 @@ import { DecryptionFailure, SessionManager, bootstrapIdentity } from '../session
 import { buildDistribution, createSenderKey } from '../senderKey';
 import { CryptoStore } from '../store';
 import { Directory } from './directory';
+import { installWebLocks } from './webLocks';
 
 const TEST_ITERATIONS = 100;
 const GROUP = 'group-1';
+
+installWebLocks();
 
 let counter = 0;
 

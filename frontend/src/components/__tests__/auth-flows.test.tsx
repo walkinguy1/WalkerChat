@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AuthOnboarding } from '../AuthOnboarding';
 import { EmptyWorkspace } from '../EmptyWorkspace';
 import { SignIn } from '../SignIn';
 import { VaultUnlock } from '../VaultUnlock';
+
+afterEach(cleanup);
 
 describe('authentication UI flows', () => {
   it('submits Google sign-in and displays safe provider errors', async () => {
@@ -57,7 +59,7 @@ describe('authentication UI flows', () => {
 
   it('keeps vault passphrase separate and requires confirmation for new vaults', async () => {
     const onUnlock = vi.fn();
-    render(<VaultUnlock isNewVault busy={false} error={null} onUnlock={onUnlock} onSignOut={vi.fn()} />);
+    render(<VaultUnlock isNewVault isLegacyVault={false} busy={false} error={null} onUnlock={onUnlock} onStartFresh={vi.fn()} onSignOut={vi.fn()} />);
     fireEvent.change(screen.getByLabelText('Vault passphrase'), { target: { value: 'a-long-vault-passphrase' } });
     fireEvent.change(screen.getByLabelText('Confirm passphrase'), { target: { value: 'a-long-vault-passphrase' } });
     fireEvent.click(screen.getByRole('button', { name: 'Create vault' }));
@@ -68,11 +70,14 @@ describe('authentication UI flows', () => {
   it('shows the empty workspace action and keeps sign-out available with no chats', async () => {
     const user = userEvent.setup();
     const onFindPeople = vi.fn();
+    const onLock = vi.fn();
     const onSignOut = vi.fn();
-    render(<EmptyWorkspace displayName="New Walker" onFindPeople={onFindPeople} onSignOut={onSignOut} />);
+    render(<EmptyWorkspace displayName="New Walker" onFindPeople={onFindPeople} onLock={onLock} onSignOut={onSignOut} />);
     expect(screen.getByText('Welcome, New Walker')).toBeTruthy();
     await user.click(screen.getByRole('button', { name: 'Find people and start a conversation' }));
     expect(onFindPeople).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole('button', { name: 'Lock vault' }));
+    expect(onLock).toHaveBeenCalledOnce();
     await user.click(screen.getByRole('button', { name: 'Sign out' }));
     expect(onSignOut).toHaveBeenCalledOnce();
   });
