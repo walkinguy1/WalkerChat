@@ -57,11 +57,11 @@ rollback was run for this phase.
 
 Google login is independent of the local encryption vault. The browser asks for a
 vault passphrase when creating or unlocking it and passes only that passphrase to
-`CryptoStore.unlock`. The passphrase is not sent to Supabase, FastAPI, or logs. Existing
-local vaults remain in the same username-scoped IndexedDB database and can be unlocked
-with the passphrase that originally created that vault. Phase 3 still needs a designed
-key-envelope/recovery and cross-device vault recovery flow; this phase does not upload
-or escrow private keys.
+`CryptoStore.unlock`. The passphrase is not sent to Supabase, FastAPI, or logs. At the
+end of Phase 2, vaults remained in the prior username-scoped IndexedDB namespace. Phase
+3 added a non-destructive migration to an immutable account-scoped namespace, detailed
+in [phase-03-vault.md](phase-03-vault.md). No recovery code or server-side key escrow
+was added.
 
 ## Human Supabase and Google setup
 
