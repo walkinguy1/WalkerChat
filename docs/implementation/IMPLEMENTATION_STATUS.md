@@ -1,6 +1,6 @@
 # WalkerChat implementation status
 
-Updated: 2026-10-19
+Updated: 2026-10-20
 
 ## Phase 1: trustworthy baseline and safe configuration
 
@@ -21,7 +21,7 @@ media storage, change the WebSocket event schema, or modify WebRTC implementatio
 | PostgreSQL and migrations | SQLAlchemy models in `backend/app/models/`; migrations are `0001_e2ee_baseline.py` and `0002_supabase_identity.py`. The second migration preserves existing `users.id` values and adds nullable Supabase identity/profile fields. `backend/alembic/env.py` takes the database URL from validated app settings. `backend/app/core/database.py` checks for missing model tables at startup. `backend/scripts/check_migration_matches_models.py` compares migration-chain table/column names without a database. |
 | Authentication | `backend/app/api/auth.py` implements development-only username/password auth, Supabase onboarding/session exchange, explicit dual-proof legacy account linking, logout, and WebSocket-ticket issuance. `backend/app/core/supabase_auth.py` verifies Supabase access tokens; `backend/app/core/security.py` maps internal JWTs to local users and handles revocation/tickets. `backend/app/core/rate_limit.py` limits auth and prekey-claim requests. |
 | WebSockets | `backend/app/api/ws.py` handles `/api/ws/chat`; `backend/app/schemas/chat.py` defines the realtime contract; `backend/app/core/ws_manager.py` tracks sockets and uses Redis Pub/Sub; `backend/app/core/runtime_state.py` stores tickets, revocations, and counters. Message routing follows chat membership. |
-| Cryptography | `frontend/src/lib/crypto/` contains X3DH, XEdDSA, Double Ratchet, Sender Keys, fingerprints, and local key storage. The existing crypto and chat tests are under `frontend/src/lib/crypto/__tests__/` and `frontend/src/lib/__tests__/`. `docs/CRYPTO.md` describes protocol details and known limits. |
+| Cryptography | `frontend/src/lib/crypto/` contains X3DH, XEdDSA, Double Ratchet, Sender Keys, fingerprints, and IndexedDB vault storage. The vault uses PBKDF2-HMAC-SHA-256 and AES-GCM in `store.ts`; Phase 3 moved new vaults to account-ID namespaces, versioned vault metadata, verified legacy copies, and serialized shared-tab state changes. Tests are under `frontend/src/lib/crypto/__tests__/`; `docs/CRYPTO.md` describes protocol details and known limits. |
 | Encrypted media | `frontend/src/lib/media.ts` encrypts/prepares images; `backend/app/api/media.py` checks membership and handles upload/download; `backend/app/core/storage.py` connects to MinIO/S3-compatible storage. The server stores opaque bytes and metadata. |
 | Calling | `frontend/src/hooks/useWebRTC.ts` and `frontend/src/components/CallOverlay.tsx` implement the browser call flow. Signaling rides the existing chat WebSocket. `backend/app/api/webrtc.py` serves ICE configuration; the backend does not carry call media. |
 
@@ -155,5 +155,41 @@ must be linked by proving both the legacy password and Google identity.
 - Internal WalkerChat API tokens remain valid until expiry or explicit logout/revocation
   (60 minutes by default). Supabase session validity is checked during token exchange;
   immediate provider revocation does not invalidate an already-issued internal token.
-- The local crypto vault remains browser/username scoped. Cross-device recovery,
-  key-envelope design, and account recovery are Phase 3 work.
+- Browser-vault layout, legacy migration behavior, lock/sign-out semantics, recovery
+  limits, validation, and later-phase prerequisites are documented in
+  [phase-03-vault.md](phase-03-vault.md). Cross-device recovery remains unimplemented.
+
+## Phase 3: browser encryption vault
+
+**Status: IMPLEMENTED; all available automated checks passed.**
+Google/Supabase account authentication remains separate from the local vault
+passphrase. New vaults use an account-ID IndexedDB namespace, require a 16-character
+minimum passphrase, and retain the current PBKDF2/AES-GCM primitives. A legacy vault is
+copied only after its stored device ID and public identity key match the authenticated
+account's device directory. Migration is idempotent and keeps the source database.
+The vault now distinguishes lock from sign-out, and browser stateful crypto updates use
+Web Locks across tabs. Recovery codes and cross-device key/ratchet transfer are not
+implemented. See [phase-03-vault.md](phase-03-vault.md) for the full design and limits.
+
+Phase 3 changed `frontend/src/lib/crypto/store.ts`, `session.ts`, `groups.ts`,
+`frontend/src/App.tsx`, `frontend/src/components/VaultUnlock.tsx`, `Sidebar.tsx`,
+`EmptyWorkspace.tsx`, and `SignIn.tsx`. Vault and UI tests changed under
+`frontend/src/lib/crypto/__tests__/` and `frontend/src/components/__tests__/`; Vitest
+now includes TSX tests via `frontend/vitest.config.ts` and `frontend/src/test-setup.ts`.
+The handoff is `docs/implementation/phase-03-vault.md`; the Phase 2 vault paragraph
+was corrected in `docs/implementation/phase-02-auth.md`.
+
+| Check | Result |
+|---|---|
+| `npm test` in `frontend/` | Passed: 12 files, 189 tests. Vitest required a run outside the sandbox because of Windows temporary-cache rename permissions. |
+| `npm run build` in `frontend/` | Passed. Vite warned that Browserslist data is about six months old. |
+| `npm run lint` in `frontend/` | Passed. |
+| `backend/.venv/Scripts/python.exe -m pytest -vv` | Passed: 40 tests in 3.94 seconds, using mocks/fakes. |
+| `backend/.venv/Scripts/python.exe -m compileall -q app alembic tests` | Passed. |
+| Backend import (`import app.main`) | Passed using the backend virtual environment. |
+| Live PostgreSQL, Supabase/Google, Redis, object storage, production browser/deployment | Not run. |
+
+The vault change touches no PostgreSQL/Alembic schema and does not change the backend
+WebSocket/API contracts. No live database, Supabase/Google, Redis, object storage,
+production browser, or deployment check was performed. Exact outcomes and recovery
+limitations are recorded in the Phase 3 handoff document.
