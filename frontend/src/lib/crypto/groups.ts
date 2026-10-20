@@ -118,7 +118,7 @@ export class GroupSessionManager {
     memberIds: string[],
     plaintext: string,
   ): Promise<{ message: string; distributions: PendingDistribution[] }> {
-    return this.enqueue(groupId, async () => {
+    return this.enqueue(groupId, () => this.store.withExclusiveLock(`group:${groupId}`, async () => {
       let state = await this.store.loadSenderKey(groupId, this.selfId);
       let distributions: PendingDistribution[] = [];
 
@@ -135,12 +135,12 @@ export class GroupSessionManager {
       await this.store.saveSenderKey(result.state);
 
       return { message: toBase64(result.message), distributions };
-    });
+    }));
   }
 
   /** Decrypt a group message from `senderId`. */
   decrypt(groupId: string, senderId: string, ciphertextBase64: string): Promise<string> {
-    return this.enqueue(groupId, async () => {
+    return this.enqueue(groupId, () => this.store.withExclusiveLock(`group:${groupId}`, async () => {
       const state = await this.store.loadSenderKey(groupId, senderId);
       if (!state) {
         // We have not received this member's sender key yet. Their next distribution
@@ -168,7 +168,7 @@ export class GroupSessionManager {
 
       await this.store.saveSenderKey(result.state);
       return fromUtf8(result.plaintext);
-    });
+    }));
   }
 
   /** Store a sender key received from another member. */
@@ -177,7 +177,9 @@ export class GroupSessionManager {
       // Our own key, echoed back from another device. Ours is authoritative.
       return;
     }
-    await this.store.saveSenderKey(acceptDistribution(distribution));
+    await this.store.withExclusiveLock(`group:${distribution.distributionId}`, () =>
+      this.store.saveSenderKey(acceptDistribution(distribution)),
+    );
   }
 
   /**
@@ -187,17 +189,19 @@ export class GroupSessionManager {
    * without rotation they can still read everything sent afterwards.
    */
   rotate(groupId: string, memberIds: string[]): Promise<PendingDistribution[]> {
-    return this.enqueue(groupId, async () => {
+    return this.enqueue(groupId, () => this.store.withExclusiveLock(`group:${groupId}`, async () => {
       const state = createSenderKey(groupId, this.selfId);
       const distributions = await this.buildDistributions(state, memberIds);
       await this.store.saveSenderKey(state);
       return distributions;
-    });
+    }));
   }
 
   /** Forget every chain for a group, for example when we leave it. */
   async forget(groupId: string): Promise<void> {
-    await this.store.clearSenderKeys(groupId);
+    await this.store.withExclusiveLock(`group:${groupId}`, () =>
+      this.store.clearSenderKeys(groupId),
+    );
   }
 
   private async buildDistributions(
