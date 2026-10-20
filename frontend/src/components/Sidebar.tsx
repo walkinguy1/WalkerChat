@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import clsx from 'clsx';
-import { Hash, LogOut, Plus, Search, ShieldCheck, Users, X } from 'lucide-react';
+import { Hash, LockKeyhole, LogOut, Plus, Search, ShieldCheck, Users, X } from 'lucide-react';
 import { Avatar } from './ui/Avatar';
 import { Logo } from './ui/Logo';
 import { IconButton } from './ui/Button';
@@ -27,6 +27,7 @@ interface SidebarProps {
   onSelectChat: (chatId: string) => void;
   onOpenSearch: () => void;
   onNewChat: () => void;
+  onLock: () => void;
   onSignOut: () => void;
   onClose: () => void;
 }
@@ -47,6 +48,7 @@ export const Sidebar = ({
   onSelectChat,
   onOpenSearch,
   onNewChat,
+  onLock,
   onSignOut,
   onClose,
 }: SidebarProps) => {
@@ -215,6 +217,9 @@ export const Sidebar = ({
               </span>
             </span>
           </span>
+          <IconButton size="sm" label="Lock vault" onClick={onLock}>
+            <LockKeyhole className="h-4 w-4" aria-hidden="true" />
+          </IconButton>
           <IconButton size="sm" label="Sign out" onClick={onSignOut}>
             <LogOut className="h-4 w-4" aria-hidden="true" />
           </IconButton>

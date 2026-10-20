@@ -17,7 +17,7 @@ import {
   ratchetEncrypt,
 } from './doubleRatchet';
 import type { RatchetState } from './doubleRatchet';
-import { fromBase64, fromUtf8, toBase64, utf8 } from './primitives';
+import { fromBase64, fromUtf8, toBase64, utf8, wipe } from './primitives';
 import { MESSAGE_TYPE_PREKEY, decodeMessage } from './serialization';
 import type { CryptoStore } from './store';
 import {
@@ -104,7 +104,10 @@ export type IdentityBootstrap = {
  * Rotation of the signed prekey happens here too, because it is the one place that
  * reliably runs on every sign-in.
  */
-export const bootstrapIdentity = async (store: CryptoStore): Promise<IdentityBootstrap> => {
+export const bootstrapIdentity = (store: CryptoStore): Promise<IdentityBootstrap> =>
+  store.withExclusiveLock('identity-bootstrap', () => bootstrapIdentityLocked(store));
+
+const bootstrapIdentityLocked = async (store: CryptoStore): Promise<IdentityBootstrap> => {
   const deviceId = await store.deviceId();
   const existingIdentity = await store.loadIdentity();
 
@@ -242,6 +245,12 @@ export class SessionManager {
     return this.identity.publicKey;
   }
 
+  /** Best-effort cleanup of this manager's in-memory identity key and queued work. */
+  close(): void {
+    wipe(this.identity.privateKey);
+    this.queues.clear();
+  }
+
   /** Run `task` with exclusive access to one peer's ratchet state. */
   private enqueue<T>(peerId: string, task: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(peerId) ?? Promise.resolve();
@@ -302,7 +311,7 @@ export class SessionManager {
     plaintext: string,
     bundle?: EncodedPreKeyBundle,
   ): Promise<string> {
-    return this.enqueue(peerId, async () => {
+    return this.enqueue(peerId, () => this.store.withExclusiveLock(`ratchet:${peerId}`, async () => {
       const state = await this.loadOrCreateOutbound(peerId, bundle);
       const result = await ratchetEncrypt(state, utf8(plaintext));
 
@@ -312,7 +321,7 @@ export class SessionManager {
       };
       await this.store.saveSession(peerId, state.peerIdentityKey, advanced);
       return toBase64(result.message);
-    });
+    }));
   }
 
   /**
@@ -325,7 +334,7 @@ export class SessionManager {
    */
   decrypt(address: DeviceAddress, ciphertextBase64: string): Promise<string> {
     const peerId = addressKey(address.userId, address.deviceRowId);
-    return this.enqueue(peerId, async () => {
+    return this.enqueue(peerId, () => this.store.withExclusiveLock(`ratchet:${peerId}`, async () => {
       let encoded: Uint8Array;
       try {
         encoded = fromBase64(ciphertextBase64);
@@ -361,7 +370,7 @@ export class SessionManager {
         { ...state, peerIdentityKey: peer.identityKey },
         encoded,
       );
-    });
+    }));
   }
 
   private async decryptPreKeyMessage(

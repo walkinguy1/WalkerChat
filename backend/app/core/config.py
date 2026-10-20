@@ -17,11 +17,13 @@ _PLACEHOLDER_MARKERS = (
     "insecure",
     "secret",
     "password",
+    "your-",
     "qwerty",
     "123456",
     "minioadmin",
     "walkerchat",
 )
+_URL_PLACEHOLDER_MARKERS = ("your-project", "example", "placeholder", "change-this")
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -48,6 +50,11 @@ class Settings(BaseSettings):
     seed_demo_accounts: bool = False
     enable_test_routes: bool = False
     demo_account_password: str | None = None
+
+    # Browser-safe Supabase configuration. The backend validates access tokens using
+    # the project's public JWKS or Auth user endpoint; no service-role key is needed.
+    supabase_url: str | None = None
+    supabase_publishable_key: str | None = None
 
     # These local service defaults are for development only. Non-development modes
     # validate that service URLs and credentials were deliberately configured.
@@ -158,6 +165,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "JWT_SECRET must be a strong, non-placeholder value of at least "
                 "32 characters outside development."
+            )
+
+        if not self.supabase_url or not self.supabase_publishable_key:
+            raise ValueError(
+                "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY are required outside development."
+            )
+        supabase_parts = urlsplit(self.supabase_url)
+        if (
+            supabase_parts.scheme != "https"
+            or not supabase_parts.netloc
+            or supabase_parts.path not in {"", "/"}
+            or supabase_parts.query
+            or supabase_parts.fragment
+            or any(
+                marker in self.supabase_url.lower()
+                for marker in _URL_PLACEHOLDER_MARKERS
+            )
+            or _contains_placeholder(self.supabase_publishable_key)
+        ):
+            raise ValueError(
+                "SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY must be explicitly configured outside development."
             )
 
         database_host = _host_from_url(self.database_url)

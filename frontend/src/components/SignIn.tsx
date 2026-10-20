@@ -7,6 +7,8 @@ interface SignInProps {
   pendingUsername: string | null;
   isSigningIn: boolean;
   onSignIn: (username: string, password: string) => void;
+  onGoogleSignIn: () => void;
+  error: string | null;
 }
 
 const capabilities = [
@@ -32,7 +34,13 @@ const capabilities = [
   },
 ];
 
-export const SignIn = ({ pendingUsername, isSigningIn, onSignIn }: SignInProps) => {
+export const SignIn = ({
+  pendingUsername,
+  isSigningIn,
+  onSignIn,
+  onGoogleSignIn,
+  error,
+}: SignInProps) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
 
@@ -104,11 +112,23 @@ export const SignIn = ({ pendingUsername, isSigningIn, onSignIn }: SignInProps) 
 
         <h2 className="text-2xl font-semibold tracking-[-0.02em]">Sign in</h2>
         <p className="mt-2 text-sm leading-6 text-ink-muted">
-          Use your WalkerChat username and password. Local demo identities are available
-          when demo seeding is enabled on the backend.
+          Sign in with Google to create or restore your WalkerChat identity.
         </p>
 
-        <form className="mt-8 space-y-4" onSubmit={submit}>
+        {error ? <p role="alert" className="mt-4 rounded-field bg-danger-soft p-3 text-sm text-danger">{error}</p> : null}
+
+        <button
+          type="button"
+          onClick={onGoogleSignIn}
+          disabled={isSigningIn}
+          className="mt-8 flex h-11 w-full items-center justify-center gap-2 rounded-field border border-line bg-panel px-4 text-sm font-medium transition-colors hover:border-line-strong disabled:opacity-60"
+        >
+          {isSigningIn ? 'Connecting…' : 'Continue with Google'}
+        </button>
+
+        {import.meta.env.DEV ? <>
+        <p className="mt-7 text-center text-xs text-ink-subtle">Local development sign-in</p>
+        <form className="mt-3 space-y-4" onSubmit={submit}>
           <label className="block text-sm font-medium" htmlFor="username">
             Username
             <input
@@ -162,11 +182,12 @@ export const SignIn = ({ pendingUsername, isSigningIn, onSignIn }: SignInProps) 
             )}
           </button>
         </form>
+        </> : null}
 
         <p className="mt-8 flex items-start gap-2.5 rounded-field border border-line bg-panel p-3.5 text-[13px] leading-6 text-ink-muted">
           <Lock className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-signal" aria-hidden="true" />
-          Your identity keypair is generated in this browser and stored locally. Signing out
-          clears the derived session keys.
+          Your identity keypair is generated in this browser and stored in your encrypted local
+          vault. Signing out locks the in-memory keys; encrypted vault data stays on this device.
         </p>
       </div>
     </section>

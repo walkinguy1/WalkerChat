@@ -27,6 +27,8 @@ def production_settings(**overrides: object) -> Settings:
         ),
         "redis_url": "rediss://redis.internal:6379/0",
         "cors_origins": ["https://chat.example.com"],
+        "supabase_url": "https://walkerchat-test.supabase.co",
+        "supabase_publishable_key": "sb_publishable_unit_test_key_abc123",
         "minio_endpoint": "storage.internal:9000",
         "minio_access_key": "minio-live-access-8",
         "minio_secret_key": "A7!cD9@fG2#hJ5$k",
@@ -86,6 +88,17 @@ def test_production_settings_accept_explicit_service_origins_and_credentials() -
     settings = production_settings()
     assert settings.app_env == "production"
     assert settings.cors_origins == ["https://chat.example.com"]
+
+
+def test_non_development_requires_supabase_project_and_publishable_key() -> None:
+    with pytest.raises(ValueError, match="SUPABASE_URL"):
+        production_settings(supabase_url=None)
+
+    with pytest.raises(ValueError, match="SUPABASE_URL"):
+        production_settings(supabase_publishable_key="your-supabase-publishable-key")
+
+    with pytest.raises(ValueError, match="SUPABASE_URL"):
+        production_settings(supabase_url="https://your-project-ref.supabase.co")
 
 
 def test_settings_parse_errors_do_not_echo_supplied_values() -> None:

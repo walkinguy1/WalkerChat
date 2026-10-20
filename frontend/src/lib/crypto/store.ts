@@ -4,7 +4,7 @@
  * Two things this fixes about the implementation it replaces:
  *
  *  1. Private keys no longer sit in `localStorage` as extractable PKCS#8. Everything
- *     sensitive is sealed under a key derived from the account password, so a stolen
+ *     sensitive is sealed under a key derived from the local vault passphrase, so a stolen
  *     database file is not a stolen identity.
  *  2. Ratchet state survives a reload. The old session cache was an in-memory `Map`,
  *     which meant every refresh silently reset the session.
@@ -18,14 +18,22 @@
  * method here does its crypto *before* opening a transaction, and treats the
  * transaction as a short synchronous burst.
  */
-import { IV_LEN, fromBase64, randomBytes, toBase64, utf8, wipe } from './primitives';
+import {
+  IV_LEN,
+  constantTimeEqual,
+  fromBase64,
+  randomBytes,
+  toBase64,
+  utf8,
+  wipe,
+} from './primitives';
 import { aeadOpen, aeadSeal } from './primitives';
 import type { RatchetState } from './doubleRatchet';
 import type { SenderKeyState } from './senderKey';
 import type { IdentityKeyPair, OneTimePreKey, SignedPreKey } from './x3dh';
 
 const DB_NAME = 'walkerchat-crypto';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 const STORE_META = 'meta';
 const STORE_IDENTITY = 'identity';
@@ -52,10 +60,40 @@ const ALL_STORES = [
  * every case; production callers should leave it alone.
  */
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
+export const VAULT_PASSPHRASE_MIN_LENGTH = 16;
 
-const VERIFIER_PLAINTEXT = utf8('walkerchat-vault-v1');
+const KDF_VERSION = 1;
+const VAULT_VERSION = 2;
+const RECORD_VERSION = 1;
+const LEGACY_VERIFIER_PLAINTEXT = utf8('walkerchat-vault-v1');
+const VERIFIER_PLAINTEXT = utf8('walkerchat-vault-v2');
+const MAX_PBKDF2_ITERATIONS = 10_000_000;
 
 type SealedBlob = { iv: Uint8Array; ciphertext: Uint8Array };
+
+type VaultRecord = {
+  id: 'vault';
+  salt: Uint8Array;
+  iterations: number;
+  verifier: SealedBlob;
+  vaultVersion?: number;
+  kdfVersion?: number;
+  recordVersion?: number;
+};
+
+type VaultOwnerRecord = { id: 'owner'; accountId: string };
+type MigrationRecord = {
+  id: 'namespace-migration';
+  version: 1;
+  accountId: string;
+  sourceDatabaseName: string;
+};
+
+export const accountVaultDatabaseName = (accountId: string): string =>
+  `walkerchat-vault-v2-${encodeURIComponent(accountId)}`;
+
+export const legacyVaultDatabaseName = (username: string | null | undefined, accountId: string): string =>
+  `walkerchat-crypto-${username || accountId}`;
 
 // --- IndexedDB promise glue ------------------------------------------------
 
@@ -71,6 +109,21 @@ const transactionDone = (tx: IDBTransaction): Promise<void> =>
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
   });
+
+const readAllStores = async (db: IDBDatabase): Promise<Map<string, unknown[]>> => {
+  const tx = db.transaction(ALL_STORES, 'readonly');
+  const done = transactionDone(tx);
+  const records = await Promise.all(
+    ALL_STORES.map(async (name) => [name, await request(tx.objectStore(name).getAll())] as const),
+  );
+  await done;
+  return new Map(records);
+};
+
+const isDatabaseEmpty = async (db: IDBDatabase): Promise<boolean> => {
+  const records = await readAllStores(db);
+  return [...records.values()].every((storeRecords) => storeRecords.length === 0);
+};
 
 export const openDatabase = (name: string = DB_NAME): Promise<IDBDatabase> =>
   new Promise((resolve, reject) => {
@@ -170,21 +223,15 @@ export class CryptoStore {
   }
 
   /**
-   * Derive the vault key from the account password, creating the vault on first use.
+   * Derive the vault key from the local passphrase, creating the vault on first use.
    *
-   * Throws on a wrong password rather than failing later with an opaque decryption
+   * Throws on a wrong passphrase rather than failing later with an opaque decryption
    * error somewhere deep in the ratchet.
    */
   /** This installation's stable device id, created on first unlock. */
   async deviceId(): Promise<string> {
-    const readTx = this.db.transaction(STORE_META, 'readonly');
-    const existing = (await request(readTx.objectStore(STORE_META).get('device'))) as
-      | { id: string; deviceId: string }
-      | undefined;
-
-    if (existing) {
-      return existing.deviceId;
-    }
+    const existing = await this.storedDeviceId();
+    if (existing) return existing;
 
     // Generated locally and never regenerated: it is what ties this browser profile's
     // ratchets to a row the server can address envelopes to.
@@ -196,44 +243,308 @@ export class CryptoStore {
     return deviceId;
   }
 
-  static async unlock(
-    password: string,
-    options: { databaseName?: string; iterations?: number } = {},
-  ): Promise<CryptoStore> {
-    const db = await openDatabase(options.databaseName);
-    const iterations = options.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
-
-    const readTx = db.transaction(STORE_META, 'readonly');
-    const existing = (await request(readTx.objectStore(STORE_META).get('vault'))) as
-      | { id: string; salt: Uint8Array; iterations: number; verifier: SealedBlob }
+  async storedDeviceId(): Promise<string | null> {
+    const readTx = this.db.transaction(STORE_META, 'readonly');
+    const existing = (await request(readTx.objectStore(STORE_META).get('device'))) as
+      | { id: string; deviceId: string }
       | undefined;
+    return typeof existing?.deviceId === 'string' ? existing.deviceId : null;
+  }
 
-    if (existing) {
-      const masterKey = await deriveMasterKey(password, existing.salt, existing.iterations);
-      try {
-        await aeadOpen(
-          masterKey,
-          existing.verifier.iv,
-          existing.verifier.ciphertext,
-          new Uint8Array(0),
-        );
-      } catch {
-        wipe(masterKey);
-        throw new Error('Incorrect password: unable to unlock the key vault.');
+  /** Serialize stateful work from tabs sharing this account/device database. */
+  async withExclusiveLock<T>(resource: string, task: () => Promise<T>): Promise<T> {
+    if (typeof navigator === 'undefined' || !navigator.locks) {
+      throw new Error(
+        'This browser cannot safely coordinate a shared encryption vault across tabs. Use a browser with Web Locks over localhost or HTTPS.',
+      );
+    }
+    const lockName = `walkerchat:${this.db.name}:${resource}`;
+    return navigator.locks.request(lockName, { mode: 'exclusive' }, task);
+  }
+
+  static async hasVault(databaseName?: string): Promise<boolean> {
+    const db = await openDatabase(databaseName);
+    try {
+      const tx = db.transaction(STORE_META, 'readonly');
+      return Boolean(await request(tx.objectStore(STORE_META).get('vault')));
+    } finally {
+      db.close();
+    }
+  }
+
+  /**
+   * Copy a legacy username-named vault into the stable account namespace.
+   * The caller must first confirm its device id and public identity key against the
+   * authenticated account's server device directory. The source database is never
+   * modified or deleted by this operation.
+   */
+  async migrateToAccount(databaseName: string, accountId: string): Promise<CryptoStore> {
+    if (!accountId || databaseName === this.db.name) {
+      throw new Error('Invalid local vault migration target.');
+    }
+    if (!this.masterKey) throw new Error('Key vault is locked.');
+    const migrationKey = this.key().slice();
+
+    try {
+      return await this.withExclusiveLock(`migration:${databaseName}`, async () => {
+      await this.verifyAllRecords();
+      const sourceRecords = await readAllStores(this.db);
+      const sourceMeta = sourceRecords.get(STORE_META) as Record<string, unknown>[];
+      const sourceVault = sourceMeta.find((record) => record.id === 'vault') as
+        | VaultRecord
+        | undefined;
+      const sourceOwner = sourceMeta.find((record) => record.id === 'owner') as
+        | VaultOwnerRecord
+        | undefined;
+      if (!sourceVault || !(await this.storedDeviceId())) {
+        throw new Error('The older local vault is incomplete and was left unchanged.');
       }
-      return new CryptoStore(db, masterKey);
+      if (sourceOwner && sourceOwner.accountId !== accountId) {
+        throw new Error('The older local vault belongs to a different WalkerChat account.');
+      }
+
+      const target = await openDatabase(databaseName);
+      try {
+        const targetRecords = await readAllStores(target);
+        const targetMeta = targetRecords.get(STORE_META) as Record<string, unknown>[];
+        const priorMigration = targetMeta.find(
+          (record) => record.id === 'namespace-migration',
+        ) as MigrationRecord | undefined;
+        if (priorMigration) {
+          if (
+            priorMigration.version !== 1 ||
+            priorMigration.accountId !== accountId ||
+            priorMigration.sourceDatabaseName !== this.db.name
+          ) {
+            throw new Error('The destination contains a different local vault migration.');
+          }
+          const migrated = new CryptoStore(target, migrationKey.slice());
+          try {
+            await migrated.verifyAllRecords(accountId);
+            return migrated;
+          } catch {
+            // Keep the target connection open and retry a complete atomic copy from
+            // the authenticated source. The source remains untouched either way.
+            migrated.lock();
+          }
+        } else if (![...targetRecords.values()].every((records) => records.length === 0)) {
+          throw new Error('The destination already contains local vault data.');
+        }
+
+        const needsVerifierUpgrade = sourceVault.vaultVersion === 1 || sourceVault.vaultVersion === undefined;
+        const upgradedIv = needsVerifierUpgrade ? randomBytes(IV_LEN) : sourceVault.verifier.iv;
+        const upgradedCiphertext = needsVerifierUpgrade
+          ? await aeadSeal(this.key(), upgradedIv, VERIFIER_PLAINTEXT, new Uint8Array(0))
+          : sourceVault.verifier.ciphertext;
+        const upgradedVault: VaultRecord = {
+          ...sourceVault,
+          vaultVersion: VAULT_VERSION,
+          kdfVersion: KDF_VERSION,
+          recordVersion: RECORD_VERSION,
+          verifier: { iv: upgradedIv, ciphertext: upgradedCiphertext },
+        };
+        const upgradedMeta = sourceMeta.filter((record) => record.id !== 'vault');
+        upgradedMeta.push(upgradedVault as unknown as Record<string, unknown>);
+        sourceRecords.set(STORE_META, upgradedMeta);
+
+        const writeTx = target.transaction(ALL_STORES, 'readwrite');
+        const writeDone = transactionDone(writeTx);
+        ALL_STORES.forEach((name) => {
+          const store = writeTx.objectStore(name);
+          store.clear();
+          const records = sourceRecords.get(name) ?? [];
+          records.forEach((record) => store.put(record));
+        });
+        const meta = writeTx.objectStore(STORE_META);
+        meta.put({ id: 'owner', accountId });
+        meta.put({
+          id: 'namespace-migration',
+          version: 1,
+          accountId,
+          sourceDatabaseName: this.db.name,
+        } satisfies MigrationRecord);
+        await writeDone;
+
+        const migrated = new CryptoStore(target, migrationKey.slice());
+        try {
+          await migrated.verifyAllRecords(accountId);
+          return migrated;
+        } catch (error) {
+          migrated.close();
+          throw new Error(
+            'The copied local vault could not be verified. The older vault is unchanged; retry the migration or start a separate device vault.',
+            { cause: error },
+          );
+        }
+      } catch (error) {
+        target.close();
+        throw error;
+      }
+      });
+    } finally {
+      wipe(migrationKey);
+    }
+  }
+
+  /** Authenticate every sealed record before/after a namespace migration. */
+  async verifyAllRecords(expectedAccountId?: string): Promise<void> {
+    const records = await readAllStores(this.db);
+    const meta = records.get(STORE_META) as Record<string, unknown>[];
+    const vault = meta.find((record) => record.id === 'vault') as VaultRecord | undefined;
+    const owner = meta.find((record) => record.id === 'owner') as
+      | VaultOwnerRecord
+      | undefined;
+    if (!vault) throw new Error('Vault verifier is missing.');
+    if (expectedAccountId && owner?.accountId !== expectedAccountId) {
+      throw new Error('Vault account binding does not match.');
     }
 
-    const salt = randomBytes(16);
-    const masterKey = await deriveMasterKey(password, salt, iterations);
-    const iv = randomBytes(IV_LEN);
-    const ciphertext = await aeadSeal(masterKey, iv, VERIFIER_PLAINTEXT, new Uint8Array(0));
+    const verifier = await this.open(vault.verifier);
+    const verifierText = (vault.vaultVersion ?? 1) === 1
+      ? LEGACY_VERIFIER_PLAINTEXT
+      : VERIFIER_PLAINTEXT;
+    const verifierValid = constantTimeEqual(verifier, verifierText);
+    wipe(verifier);
+    if (!verifierValid) throw new Error('Vault verifier did not authenticate.');
 
-    const writeTx = db.transaction(STORE_META, 'readwrite');
-    writeTx.objectStore(STORE_META).put({ id: 'vault', salt, iterations, verifier: { iv, ciphertext } });
-    await transactionDone(writeTx);
+    for (const storeName of [
+      STORE_IDENTITY,
+      STORE_SIGNED_PREKEYS,
+      STORE_ONE_TIME_PREKEYS,
+      STORE_SESSIONS,
+      STORE_SENDER_KEYS,
+      STORE_OUTGOING,
+    ]) {
+      for (const record of records.get(storeName) ?? []) {
+        const wrapped = (record as { wrapped?: SealedBlob }).wrapped;
+        if (!wrapped) throw new Error('A sealed vault record is incomplete.');
+        const plaintext = await this.open(wrapped);
+        // AES-GCM authentication is sufficient to validate the copy. Parsing these
+        // plaintexts would create extra JS strings/arrays containing key material.
+        wipe(plaintext);
+      }
+    }
+  }
 
-    return new CryptoStore(db, masterKey);
+  static async unlock(
+    passphrase: string,
+    options: {
+      databaseName?: string;
+      accountId?: string;
+      iterations?: number;
+      deferVaultUpgrade?: boolean;
+    } = {},
+  ): Promise<CryptoStore> {
+    const db = await openDatabase(options.databaseName);
+    try {
+      const readTx = db.transaction(STORE_META, 'readonly');
+      const done = transactionDone(readTx);
+      const meta = readTx.objectStore(STORE_META);
+      const [existing, owner] = await Promise.all([
+        request(meta.get('vault')) as Promise<VaultRecord | undefined>,
+        request(meta.get('owner')) as Promise<VaultOwnerRecord | undefined>,
+      ]);
+      await done;
+
+      if (options.accountId && owner && owner.accountId !== options.accountId) {
+        throw new Error('This local vault belongs to a different WalkerChat account.');
+      }
+      if (options.accountId && existing && !owner) {
+        throw new Error('This older vault must be verified before it can be opened here.');
+      }
+
+      if (existing) {
+        const vaultVersion = existing.vaultVersion ?? 1;
+        const kdfVersion = existing.kdfVersion ?? 1;
+        const recordVersion = existing.recordVersion ?? 1;
+        if (
+          !Number.isInteger(existing.iterations) ||
+          existing.iterations < 1 ||
+          existing.iterations > MAX_PBKDF2_ITERATIONS ||
+          !(existing.salt instanceof Uint8Array) ||
+          existing.salt.length !== 16 ||
+          kdfVersion !== KDF_VERSION ||
+          recordVersion !== RECORD_VERSION ||
+          ![1, VAULT_VERSION].includes(vaultVersion) ||
+          !(existing.verifier?.iv instanceof Uint8Array) ||
+          existing.verifier.iv.length !== IV_LEN ||
+          !(existing.verifier.ciphertext instanceof Uint8Array)
+        ) {
+          throw new Error('This local vault uses an unsupported or damaged format.');
+        }
+
+        const masterKey = await deriveMasterKey(passphrase, existing.salt, existing.iterations);
+        try {
+          const verifier = await aeadOpen(
+            masterKey,
+            existing.verifier.iv,
+            existing.verifier.ciphertext,
+            new Uint8Array(0),
+          );
+          const expected = vaultVersion === 1 ? LEGACY_VERIFIER_PLAINTEXT : VERIFIER_PLAINTEXT;
+          const valid = constantTimeEqual(verifier, expected);
+          wipe(verifier);
+          if (!valid) throw new Error('Vault verifier mismatch.');
+        } catch {
+          wipe(masterKey);
+          throw new Error('Incorrect passphrase or damaged local vault.');
+        }
+
+        if (
+          !options.deferVaultUpgrade &&
+          (vaultVersion === 1 || existing.kdfVersion === undefined)
+        ) {
+          const iv = randomBytes(IV_LEN);
+          const ciphertext = await aeadSeal(masterKey, iv, VERIFIER_PLAINTEXT, new Uint8Array(0));
+          const writeTx = db.transaction(STORE_META, 'readwrite');
+          writeTx.objectStore(STORE_META).put({
+            ...existing,
+            vaultVersion: VAULT_VERSION,
+            kdfVersion: KDF_VERSION,
+            recordVersion: RECORD_VERSION,
+            verifier: { iv, ciphertext },
+          });
+          await transactionDone(writeTx);
+        }
+        return new CryptoStore(db, masterKey);
+      }
+
+      if (!(await isDatabaseEmpty(db))) {
+        throw new Error('This local vault is incomplete. Its records have been preserved.');
+      }
+      if (passphrase.length < VAULT_PASSPHRASE_MIN_LENGTH) {
+        throw new Error(
+          `Choose a vault passphrase with at least ${VAULT_PASSPHRASE_MIN_LENGTH} characters.`,
+        );
+      }
+
+      const iterations = options.iterations ?? DEFAULT_PBKDF2_ITERATIONS;
+      if (!Number.isInteger(iterations) || iterations < 1 || iterations > MAX_PBKDF2_ITERATIONS) {
+        throw new Error('The configured vault key-derivation cost is invalid.');
+      }
+      const salt = randomBytes(16);
+      const masterKey = await deriveMasterKey(passphrase, salt, iterations);
+      const iv = randomBytes(IV_LEN);
+      const ciphertext = await aeadSeal(masterKey, iv, VERIFIER_PLAINTEXT, new Uint8Array(0));
+
+      const writeTx = db.transaction(STORE_META, 'readwrite');
+      const writeMeta = writeTx.objectStore(STORE_META);
+      writeMeta.put({
+        id: 'vault',
+        salt,
+        iterations,
+        verifier: { iv, ciphertext },
+        vaultVersion: VAULT_VERSION,
+        kdfVersion: KDF_VERSION,
+        recordVersion: RECORD_VERSION,
+      });
+      if (options.accountId) writeMeta.put({ id: 'owner', accountId: options.accountId });
+      await transactionDone(writeTx);
+      return new CryptoStore(db, masterKey);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
   }
 
   private key(): Uint8Array {
@@ -365,19 +676,25 @@ export class CryptoStore {
 
   /** Fetch and delete a one-time prekey. Returns null if it was already consumed. */
   async takeOneTimePreKey(keyId: string): Promise<OneTimePreKey | null> {
-    const readTx = this.db.transaction(STORE_ONE_TIME_PREKEYS, 'readonly');
-    const record = (await request(readTx.objectStore(STORE_ONE_TIME_PREKEYS).get(keyId))) as
+    const consumeTx = this.db.transaction(STORE_ONE_TIME_PREKEYS, 'readwrite');
+    const consumeDone = transactionDone(consumeTx);
+    const store = consumeTx.objectStore(STORE_ONE_TIME_PREKEYS);
+    let record:
       | { keyId: string; publicKey: Uint8Array; wrapped: SealedBlob }
       | undefined;
+    const get = store.get(keyId);
+    get.onsuccess = () => {
+      record = get.result;
+      if (record) store.delete(keyId);
+    };
+    await consumeDone;
     if (!record) {
       return null;
     }
 
+    // The IndexedDB delete is committed before WebCrypto runs. Two tabs cannot both
+    // receive the same private prekey, even if authentication later detects damage.
     const privateKey = await this.open(record.wrapped);
-
-    const deleteTx = this.db.transaction(STORE_ONE_TIME_PREKEYS, 'readwrite');
-    deleteTx.objectStore(STORE_ONE_TIME_PREKEYS).delete(keyId);
-    await transactionDone(deleteTx);
 
     return { keyId: record.keyId, keyPair: { publicKey: record.publicKey, privateKey } };
   }
@@ -392,8 +709,12 @@ export class CryptoStore {
 
   async saveSession(peerId: string, peerIdentityKey: Uint8Array, state: RatchetState): Promise<void> {
     const encoded = encodeState(state);
-    const wrapped = await this.seal(encoded);
-    wipe(encoded);
+    let wrapped: SealedBlob;
+    try {
+      wrapped = await this.seal(encoded);
+    } finally {
+      wipe(encoded);
+    }
 
     const tx = this.db.transaction(STORE_SESSIONS, 'readwrite');
     tx.objectStore(STORE_SESSIONS).put({
@@ -412,7 +733,12 @@ export class CryptoStore {
     if (!record) {
       return null;
     }
-    return decodeState(await this.open(record.wrapped));
+    const encoded = await this.open(record.wrapped);
+    try {
+      return decodeState(encoded);
+    } finally {
+      wipe(encoded);
+    }
   }
 
   async deleteSession(peerId: string, peerIdentityKey: Uint8Array): Promise<void> {
@@ -435,8 +761,12 @@ export class CryptoStore {
         value instanceof Uint8Array ? { $bytes: toBase64(value) } : value,
       ),
     );
-    const wrapped = await this.seal(encoded);
-    wipe(encoded);
+    let wrapped: SealedBlob;
+    try {
+      wrapped = await this.seal(encoded);
+    } finally {
+      wipe(encoded);
+    }
 
     const tx = this.db.transaction(STORE_SENDER_KEYS, 'readwrite');
     tx.objectStore(STORE_SENDER_KEYS).put({
@@ -460,16 +790,20 @@ export class CryptoStore {
     }
 
     const bytes = await this.open(record.wrapped);
-    return JSON.parse(new TextDecoder().decode(bytes), (_key, value) => {
-      if (
-        value &&
-        typeof value === 'object' &&
-        typeof (value as { $bytes?: string }).$bytes === 'string'
-      ) {
-        return fromBase64((value as { $bytes: string }).$bytes);
-      }
-      return value;
-    }) as SenderKeyState;
+    try {
+      return JSON.parse(new TextDecoder().decode(bytes), (_key, value) => {
+        if (
+          value &&
+          typeof value === 'object' &&
+          typeof (value as { $bytes?: string }).$bytes === 'string'
+        ) {
+          return fromBase64((value as { $bytes: string }).$bytes);
+        }
+        return value;
+      }) as SenderKeyState;
+    } finally {
+      wipe(bytes);
+    }
   }
 
   /**
@@ -509,7 +843,13 @@ export class CryptoStore {
     chatId: string,
     plaintext: string,
   ): Promise<void> {
-    const wrapped = await this.seal(utf8(plaintext));
+    const bytes = utf8(plaintext);
+    let wrapped: SealedBlob;
+    try {
+      wrapped = await this.seal(bytes);
+    } finally {
+      wipe(bytes);
+    }
 
     const tx = this.db.transaction(STORE_OUTGOING, 'readwrite');
     tx.objectStore(STORE_OUTGOING).put({ clientMessageId, chatId, wrapped });
@@ -525,7 +865,12 @@ export class CryptoStore {
     if (!record) {
       return null;
     }
-    return new TextDecoder().decode(await this.open(record.wrapped));
+    const plaintext = await this.open(record.wrapped);
+    try {
+      return new TextDecoder().decode(plaintext);
+    } finally {
+      wipe(plaintext);
+    }
   }
 
   /** Every message this device sent in one chat, keyed by client message id. */
@@ -536,10 +881,14 @@ export class CryptoStore {
     )) as { clientMessageId: string; wrapped: SealedBlob }[];
 
     const entries = await Promise.all(
-      records.map(
-        async (record) =>
-          [record.clientMessageId, new TextDecoder().decode(await this.open(record.wrapped))] as const,
-      ),
+      records.map(async (record) => {
+        const plaintext = await this.open(record.wrapped);
+        try {
+          return [record.clientMessageId, new TextDecoder().decode(plaintext)] as const;
+        } finally {
+          wipe(plaintext);
+        }
+      }),
     );
     return new Map(entries);
   }
@@ -624,7 +973,7 @@ export class CryptoStore {
     }
   }
 
-  /** Wipe all key material, for sign-out on a shared machine. */
+  /** Remove local vault records and forget the key. Account sign-out does not call this. */
   async clear(): Promise<void> {
     const tx = this.db.transaction(ALL_STORES, 'readwrite');
     ALL_STORES.forEach((name) => tx.objectStore(name).clear());
@@ -639,11 +988,11 @@ export class CryptoStore {
 }
 
 const deriveMasterKey = async (
-  password: string,
+  passphrase: string,
   salt: Uint8Array,
   iterations: number,
 ): Promise<Uint8Array> => {
-  const material = await crypto.subtle.importKey('raw', utf8(password) as BufferSource, 'PBKDF2', false, [
+  const material = await crypto.subtle.importKey('raw', utf8(passphrase) as BufferSource, 'PBKDF2', false, [
     'deriveBits',
   ]);
   const bits = await crypto.subtle.deriveBits(
