@@ -381,10 +381,12 @@ async def test_local_password_routes_are_not_available_outside_development(monke
         "cors_origins": ["https://chat.example.com"],
         "supabase_url": "https://phase2-test.supabase.co",
         "supabase_publishable_key": "sb_publishable_unit_test_key_abc123",
-        "minio_endpoint": "storage.internal:9000",
-        "minio_access_key": "minio-live-access-8",
-        "minio_secret_key": "A7!cD9@fG2#hJ5$k",
-        "minio_secure": True,
+        "storage_backend": "supabase",
+        "supabase_storage_endpoint": "https://phase2-test.storage.supabase.co/storage/v1/s3",
+        "supabase_storage_region": "us-west-1",
+        "supabase_storage_access_key": "storage-access-key-2026",
+        "supabase_storage_secret_key": "A7!cD9@fG2#hJ5$kL8!mN2@pQ5",
+        "media_bucket": "walkerchat-private-test",
     }))
     with pytest.raises(HTTPException) as error:
         await auth.login(auth.LoginRequest(username="old_account", password="pw"), fake_request(), FakeSession())

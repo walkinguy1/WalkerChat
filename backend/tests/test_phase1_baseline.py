@@ -29,10 +29,12 @@ def production_settings(**overrides: object) -> Settings:
         "cors_origins": ["https://chat.example.com"],
         "supabase_url": "https://walkerchat-test.supabase.co",
         "supabase_publishable_key": "sb_publishable_unit_test_key_abc123",
-        "minio_endpoint": "storage.internal:9000",
-        "minio_access_key": "minio-live-access-8",
-        "minio_secret_key": "A7!cD9@fG2#hJ5$k",
-        "minio_secure": True,
+        "storage_backend": "supabase",
+        "supabase_storage_endpoint": "https://walkerchat-test.storage.supabase.co/storage/v1/s3",
+        "supabase_storage_region": "us-west-1",
+        "supabase_storage_access_key": "storage-access-key-2026",
+        "supabase_storage_secret_key": "A7!cD9@fG2#hJ5$kL8!mN2@pQ5",
+        "media_bucket": "walkerchat-private-test",
     }
     values.update(overrides)
     return Settings(**values)
@@ -80,8 +82,26 @@ def test_non_development_requires_non_local_services_and_explicit_https_cors() -
     with pytest.raises(ValueError, match="REDIS_URL"):
         production_settings(redis_url="redis://localhost:6379/0")
 
-    with pytest.raises(ValueError, match="MINIO_ENDPOINT"):
-        production_settings(minio_secret_key="change-this-minio-password")
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE"):
+        production_settings(supabase_storage_secret_key="change-this-storage-password")
+
+    with pytest.raises(ValueError, match="STORAGE_BACKEND"):
+        production_settings(storage_backend="minio")
+
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE"):
+        production_settings(
+            supabase_storage_endpoint="http://localhost:9000",
+            supabase_storage_access_key="minioadmin",
+            supabase_storage_secret_key="change-this-minio-password",
+        )
+
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE"):
+        production_settings(
+            supabase_storage_endpoint="https://different-project.storage.supabase.co/storage/v1/s3"
+        )
+
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE"):
+        production_settings(media_bucket="your-private-bucket")
 
 
 def test_production_settings_accept_explicit_service_origins_and_credentials() -> None:
