@@ -1,6 +1,6 @@
 # WalkerChat implementation status
 
-Updated: 2026-10-20
+Updated: 2026-11-19
 
 ## Phase 1: trustworthy baseline and safe configuration
 
@@ -23,7 +23,7 @@ media storage, change the WebSocket event schema, or modify WebRTC implementatio
 | WebSockets | `backend/app/api/ws.py` handles `/api/ws/chat`; `backend/app/schemas/chat.py` defines the realtime contract; `backend/app/core/ws_manager.py` tracks sockets and uses Redis Pub/Sub; `backend/app/core/runtime_state.py` stores tickets, revocations, and counters. Message routing follows chat membership. |
 | Contact discovery and group authorization | `backend/app/api/chats.py` and `backend/app/services/chat_admin.py` implement username search, contact requests/blocks, direct-chat eligibility, and owner/admin group mutation checks. `backend/app/models/contact.py` defines relationship records. `backend/app/api/keys.py` limits key discovery to self, accepted contacts, or shared chat members; `backend/app/api/media.py` and WebSocket service checks enforce membership and block policy. Frontend workflows live in `frontend/src/components/NewChatDialog.tsx`, `GroupSettingsDialog.tsx`, `frontend/src/lib/api.ts`, and `frontend/src/App.tsx`. |
 | Cryptography | `frontend/src/lib/crypto/` contains X3DH, XEdDSA, Double Ratchet, Sender Keys, fingerprints, and IndexedDB vault storage. The vault uses PBKDF2-HMAC-SHA-256 and AES-GCM in `store.ts`; Phase 3 moved new vaults to account-ID namespaces, versioned vault metadata, verified legacy copies, and serialized shared-tab state changes. Tests are under `frontend/src/lib/crypto/__tests__/`; `docs/CRYPTO.md` describes protocol details and known limits. |
-| Encrypted media | `frontend/src/lib/media.ts` encrypts/prepares images; `backend/app/api/media.py` checks membership and handles upload/download; `backend/app/core/storage.py` connects to MinIO/S3-compatible storage. The server stores opaque bytes and metadata. |
+| Encrypted media | `frontend/src/lib/media.ts` validates and encrypts image/PDF/UTF-8 text attachments with per-file AES-GCM keys; `EncryptedAttachment.tsx` decrypts locally and uses download-first documents. `backend/app/api/media.py` checks chat authorization; `backend/app/core/storage.py` uses MinIO locally or private Supabase Storage S3 in non-development deployments. The server stores opaque bytes and non-sensitive operational metadata only. |
 | Calling | `frontend/src/hooks/useWebRTC.ts` and `frontend/src/components/CallOverlay.tsx` implement the browser call flow. Signaling rides the existing chat WebSocket. `backend/app/api/webrtc.py` serves ICE configuration; the backend does not carry call media. |
 
 ### Configuration and security baseline
@@ -246,3 +246,39 @@ handle conflict review, live PostgreSQL concurrency and authorization integratio
 checks, shared Redis, storage, and provider/deployment verification. Group removal
 requires client sender-key rotation; this is a Phase 6 prerequisite, not implemented in
 Phase 4.
+
+## Phase 5: private encrypted attachments
+
+**Status: IMPLEMENTED; all available automated checks passed.** New uploads use the
+Supabase Storage S3-compatible endpoint in staging/production and local MinIO in
+development. Production settings require an explicit HTTPS project S3 endpoint, region,
+server-only credentials, and bucket name; startup fails if the configured bucket is
+unavailable. The app does not create Supabase buckets, publish URLs, or store filenames,
+MIME, IVs, or decryption keys in plaintext server metadata. Existing media rows and
+foreign keys are unchanged. New image descriptors are version 2 while old unversioned
+image descriptors remain readable. Version 2 file descriptors add PDF and UTF-8 plain
+text as download-only formats; Office archives remain unsupported. See
+[phase-05-storage-files.md](phase-05-storage-files.md) for dashboard setup, limits,
+historical object cutover, migration/rollback notes, and security limitations.
+
+| Check | Result |
+|---|---|
+| Frontend `npm test -- --run` | Passed: 14 files, 199 tests. Vitest used an ignored temp directory under `frontend/node_modules` to avoid the sandbox Windows cache-rename restriction. A concurrent run timed out one existing Sender Keys test; the isolated full rerun passed. |
+| Frontend `npm run build` | Passed. Vite noted Browserslist data is seven months old. |
+| Frontend `npm run lint` | Passed. |
+| Backend `python -m pytest -q` | Passed: 58 tests in 4.14 seconds, run from a temporary directory so repository `.env` files were not loaded. |
+| Backend compile (`compileall`) | Passed for `app`, `alembic`, and `tests`. |
+| Backend import (`import app.main`) | Passed from a temporary directory. |
+| `scripts/check_migration_matches_models.py` | Passed: 11 tables, 61 columns; no schema changes were needed. |
+| Alembic `upgrade head --sql` | Passed: offline SQL generated (6,951 bytes); no database connection was made. |
+| `docker compose --env-file .env.example config --quiet` | Passed. |
+| Live PostgreSQL, Redis, MinIO, Supabase Storage, historical object copy, production deployment | Not run. |
+
+Phase 5 changes backend storage configuration/adapter and startup, bounded authorized
+media routes, frontend attachment validation/encryption/serialization/decryption,
+tests, local configuration examples, Compose wiring, and this implementation guide.
+No Alembic migration or destructive cleanup was added. An installation with existing
+MinIO media must copy ciphertext objects under the exact existing keys into the private
+Supabase bucket before changing providers. The current browser reads files into memory;
+the supported ceiling is 8 MiB plaintext, and server-side multipart/resumable upload is
+not implemented. Keep MinIO intact until historical-object migration is verified.
