@@ -1,15 +1,22 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import clsx from 'clsx';
 import { Check, Search, Users, X } from 'lucide-react';
 
 import { Avatar } from './ui/Avatar';
 import { Button, IconButton } from './ui/Button';
 import type { UserProfile } from '../lib/api';
+import type { ContactRelations } from '../lib/api';
 
 interface NewChatDialogProps {
   open: boolean;
   onClose: () => void;
   onSearch: (query: string) => Promise<UserProfile[]>;
+  onLoadContacts: () => Promise<ContactRelations>;
+  onRequestContact: (userId: string) => Promise<void>;
+  onRespondContact: (requestId: string, action: 'accept' | 'reject') => Promise<void>;
+  onBlockContact: (userId: string) => Promise<void>;
+  onUnblockContact: (userId: string) => Promise<void>;
+  onRemoveContact: (userId: string) => Promise<void>;
   onCreate: (input: { type: 'DIRECT' | 'GROUP'; name?: string; memberIds: string[] }) => Promise<void>;
 }
 
@@ -19,19 +26,25 @@ interface NewChatDialogProps {
  * Selecting more than one person implies a group, so there is no mode switch to get
  * wrong -- the name field simply appears once it is needed.
  */
-export const NewChatDialog = ({ open, onClose, onSearch, onCreate }: NewChatDialogProps) => {
+export const NewChatDialog = ({ open, onClose, onSearch, onLoadContacts, onRequestContact, onRespondContact, onBlockContact, onUnblockContact, onRemoveContact, onCreate }: NewChatDialogProps) => {
   // Mounted only while open, so its state resets on close without an effect that
   // fights React by setting state during render.
   if (!open) {
     return null;
   }
 
-  return <NewChatDialogBody onClose={onClose} onSearch={onSearch} onCreate={onCreate} />;
+  return <NewChatDialogBody onClose={onClose} onSearch={onSearch} onLoadContacts={onLoadContacts} onRequestContact={onRequestContact} onRespondContact={onRespondContact} onBlockContact={onBlockContact} onUnblockContact={onUnblockContact} onRemoveContact={onRemoveContact} onCreate={onCreate} />;
 };
 
 const NewChatDialogBody = ({
   onClose,
   onSearch,
+  onLoadContacts,
+  onRequestContact,
+  onRespondContact,
+  onBlockContact,
+  onUnblockContact,
+  onRemoveContact,
   onCreate,
 }: Omit<NewChatDialogProps, 'open'>) => {
   const [query, setQuery] = useState('');
@@ -39,6 +52,15 @@ const NewChatDialogBody = ({
   const [selected, setSelected] = useState<UserProfile[]>([]);
   const [groupName, setGroupName] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+  const [relations, setRelations] = useState<ContactRelations>({ contacts: [], requests: [], blocked: [] });
+  const [busyUserId, setBusyUserId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const loadContactsRef = useRef(onLoadContacts);
+  useEffect(() => { loadContactsRef.current = onLoadContacts; }, [onLoadContacts]);
+
+  const refreshRelations = async () => setRelations(await loadContactsRef.current());
+
+  useEffect(() => { void loadContactsRef.current().then(setRelations).catch(() => undefined); }, []);
 
   const isGroup = selected.length > 1;
 
@@ -85,8 +107,44 @@ const NewChatDialogBody = ({
     );
   };
 
-  const canCreate =
-    selected.length > 0 && (!isGroup || groupName.trim().length > 0) && !isCreating;
+  const contactIds = new Set(relations.contacts.map((contact) => contact.id));
+  const canCreate = selected.length > 0 && selected.every((user) => contactIds.has(user.id)) && (!isGroup || groupName.trim().length > 0) && !isCreating;
+
+  const requestContact = async (userId: string) => {
+    setBusyUserId(userId);
+    setActionError(null);
+    try { await onRequestContact(userId); await refreshRelations(); }
+    catch { setActionError('Unable to send that contact request. Check the account and try again.'); }
+    finally { setBusyUserId(null); }
+  };
+
+  const respond = async (requestId: string, action: 'accept' | 'reject') => {
+    setBusyUserId(requestId);
+    setActionError(null);
+    try { await onRespondContact(requestId, action); await refreshRelations(); }
+    catch { setActionError('Unable to update that contact request.'); }
+    finally { setBusyUserId(null); }
+  };
+
+  const changeBlock = async (userId: string, blocked: boolean) => {
+    setBusyUserId(userId);
+    setActionError(null);
+    try {
+      if (blocked) await onUnblockContact(userId);
+      else await onBlockContact(userId);
+      if (!blocked) setSelected((previous) => previous.filter((user) => user.id !== userId));
+      await refreshRelations();
+    } catch { setActionError('Unable to update that block.'); }
+    finally { setBusyUserId(null); }
+  };
+
+  const removeContact = async (userId: string) => {
+    setBusyUserId(userId);
+    setActionError(null);
+    try { await onRemoveContact(userId); setSelected((previous) => previous.filter((user) => user.id !== userId)); await refreshRelations(); }
+    catch { setActionError('Unable to remove that contact. Existing conversations remain available.'); }
+    finally { setBusyUserId(null); }
+  };
 
   const create = async () => {
     setIsCreating(true);
@@ -118,6 +176,28 @@ const NewChatDialogBody = ({
             <X className="h-4 w-4" aria-hidden="true" />
           </IconButton>
         </div>
+
+        {relations.requests.length ? (
+          <section className="border-b border-line p-3" aria-label="Contact requests">
+            <p className="mb-2 text-xs font-semibold">Contact requests</p>
+            {relations.requests.map((entry) => (
+              <div key={entry.id} className="flex items-center gap-2 py-1.5 text-xs">
+                <span className="min-w-0 flex-1 truncate">{entry.user.display_name} · @{entry.user.username}</span>
+                {entry.direction === 'incoming' ? <>
+                  <button type="button" disabled={busyUserId === entry.id} onClick={() => void respond(entry.id, 'accept')} className="text-accent">Accept</button>
+                  <button type="button" disabled={busyUserId === entry.id} onClick={() => void respond(entry.id, 'reject')} className="text-ink-muted">Ignore</button>
+                </> : <span className="text-ink-muted">Pending</span>}
+              </div>
+            ))}
+          </section>
+        ) : null}
+        {relations.blocked.length ? (
+          <section className="border-b border-line p-3" aria-label="Blocked accounts">
+            <p className="mb-2 text-xs font-semibold">Blocked accounts</p>
+            {relations.blocked.map((entry) => <div key={entry.id} className="flex items-center gap-2 py-1.5 text-xs"><span className="min-w-0 flex-1 truncate">@{entry.username}</span><button type="button" disabled={busyUserId === entry.id} onClick={() => void changeBlock(entry.id, true)} className="text-accent">Unblock</button></div>)}
+          </section>
+        ) : null}
+        {actionError ? <p role="alert" className="border-b border-line px-4 py-2 text-xs text-danger">{actionError}</p> : null}
 
         <div className="border-b border-line p-3">
           <div className="flex items-center gap-2 rounded-field border border-line bg-sunken px-3">
@@ -172,15 +252,13 @@ const NewChatDialogBody = ({
           ) : (
             results.map((user) => {
               const isSelected = selected.some((entry) => entry.id === user.id);
+              const request = relations.requests.find((entry) => entry.user.id === user.id);
+              const isContact = contactIds.has(user.id);
+              const isBlocked = relations.blocked.some((entry) => entry.id === user.id);
               return (
-                <button
+                <div
                   key={user.id}
-                  type="button"
-                  onClick={() => toggle(user)}
-                  className={clsx(
-                    'flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors',
-                    isSelected ? 'bg-accent-soft' : 'hover:bg-raised',
-                  )}
+                  className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left"
                 >
                   <Avatar name={user.display_name} initials={user.initials} size="sm" />
                   <span className="min-w-0 flex-1">
@@ -191,10 +269,22 @@ const NewChatDialogBody = ({
                       @{user.username}
                     </span>
                   </span>
-                  {isSelected ? (
-                    <Check className="h-4 w-4 flex-shrink-0 text-accent" aria-hidden="true" />
-                  ) : null}
-                </button>
+                  {isBlocked ? (
+                    <span className="text-xs text-ink-muted">Blocked</span>
+                  ) : isContact ? (
+                    <button type="button" onClick={() => toggle(user)} className={clsx('rounded px-2 py-1 text-xs', isSelected ? 'bg-accent-soft text-accent' : 'text-ink-muted')}>
+                      {isSelected ? <Check className="inline h-3 w-3" aria-hidden="true" /> : 'Add'}
+                    </button>
+                  ) : request ? (
+                    <span className="text-xs text-ink-muted">Pending</span>
+                  ) : (
+                    <button type="button" disabled={busyUserId === user.id} onClick={() => void requestContact(user.id)} className="rounded bg-accent-soft px-2 py-1 text-xs text-accent">Request</button>
+                  )}
+                  {isContact ? <>
+                    <button type="button" disabled={busyUserId === user.id} onClick={() => void removeContact(user.id)} className="text-xs text-ink-muted">Remove</button>
+                    <button type="button" disabled={busyUserId === user.id} onClick={() => void changeBlock(user.id, false)} className="text-xs text-danger">Block</button>
+                  </> : !isBlocked ? <button type="button" disabled={busyUserId === user.id} onClick={() => void changeBlock(user.id, false)} className="text-xs text-danger">Block</button> : null}
+                </div>
               );
             })
           )}
