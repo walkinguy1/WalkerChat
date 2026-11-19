@@ -193,7 +193,7 @@ export type MediaUploadResponse = {
   created_at: string;
 };
 
-/** POST already-encrypted image bytes. The server never sees the plaintext. */
+/** POST already-encrypted attachment bytes. The server never sees the plaintext. */
 export const uploadEncryptedMedia = async (
   apiUrl: string,
   chatId: string,
@@ -218,7 +218,7 @@ export const uploadEncryptedMedia = async (
   return (await response.json()) as MediaUploadResponse;
 };
 
-/** Fetch encrypted image bytes back. Decryption happens in the caller. */
+/** Fetch encrypted attachment bytes back. Decryption happens in the caller. */
 export const fetchEncryptedMedia = async (
   apiUrl: string,
   mediaId: string,

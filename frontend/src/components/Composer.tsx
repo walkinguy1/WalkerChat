@@ -8,17 +8,18 @@ import {
   type DragEvent,
 } from 'react';
 import clsx from 'clsx';
-import { ImagePlus, Loader2, Lock, SendHorizontal, SmilePlus, X } from 'lucide-react';
+import { FileText, ImagePlus, Loader2, Lock, SendHorizontal, SmilePlus, X } from 'lucide-react';
 import { EmojiPicker } from './ui/EmojiPicker';
 import { formatBytes } from '../lib/format';
-import { ACCEPTED_IMAGE_TYPES } from '../lib/media';
+import { ACCEPTED_ATTACHMENT_TYPES, ACCEPTED_IMAGE_TYPES, MAX_ATTACHMENT_BYTES } from '../lib/media';
 import type { DisplayMessage } from '../types/chat';
 
 interface ComposerProps {
   draft: string;
   onDraftChange: (value: string) => void;
   onSend: () => void;
-  onSendPhoto: (file: File) => void;
+  onSendAttachment: (file: File) => void;
+  onAttachmentError: (message: string) => void;
   isSecure: boolean;
   isUploading: boolean;
   isSocketOpen: boolean;
@@ -34,7 +35,8 @@ export const Composer = ({
   draft,
   onDraftChange,
   onSend,
-  onSendPhoto,
+  onSendAttachment,
+  onAttachmentError,
   isSecure,
   isUploading,
   isSocketOpen,
@@ -82,12 +84,21 @@ export const Composer = ({
   }, [replyTo]);
 
   const acceptFile = useCallback((file: File | null | undefined) => {
-    if (!file || !ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+    if (!file || !ACCEPTED_ATTACHMENT_TYPES.includes(file.type)) {
+      if (file) onAttachmentError('Supported attachments are JPEG, PNG, WebP, GIF, PDF, and UTF-8 text.');
+      return;
+    }
+    if (file.size <= 0) {
+      onAttachmentError('Empty attachments cannot be sent.');
+      return;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      onAttachmentError(`Attachments must be under ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB.`);
       return;
     }
     setPending({ file, url: URL.createObjectURL(file) });
     textareaRef.current?.focus();
-  }, []);
+  }, [onAttachmentError]);
 
   const submit = () => {
     if (!canSend) return;
@@ -95,7 +106,7 @@ export const Composer = ({
     if (pending) {
       // The caption in the draft rides along with the photo, so it is cleared
       // by the send handler rather than here.
-      onSendPhoto(pending.file);
+      onSendAttachment(pending.file);
       setPending(null);
       return;
     }
@@ -105,7 +116,7 @@ export const Composer = ({
 
   const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     const file = Array.from(event.clipboardData.files).find((item) =>
-      ACCEPTED_IMAGE_TYPES.includes(item.type),
+      ACCEPTED_ATTACHMENT_TYPES.includes(item.type),
     );
     if (file) {
       event.preventDefault();
@@ -145,7 +156,7 @@ export const Composer = ({
         <div className="pointer-events-none absolute inset-2 z-10 flex animate-fade items-center justify-center rounded-card border-2 border-dashed border-accent bg-accent-soft backdrop-blur-sm">
           <span className="flex items-center gap-2 text-[13px] font-medium text-accent">
             <ImagePlus className="h-4 w-4" aria-hidden="true" />
-            Drop a photo to encrypt and send
+            Drop a file to encrypt and send
           </span>
         </div>
       ) : null}
@@ -174,11 +185,13 @@ export const Composer = ({
 
         {pending ? (
           <div className="mb-2.5 flex animate-pop items-center gap-3 rounded-field border border-line bg-sunken p-2">
-            <img
-              src={pending.url}
-              alt=""
-              className="h-12 w-12 flex-shrink-0 rounded-lg object-cover"
-            />
+            {ACCEPTED_IMAGE_TYPES.includes(pending.file.type) ? (
+              <img src={pending.url} alt="" className="h-12 w-12 flex-shrink-0 rounded-lg object-cover" />
+            ) : (
+              <span className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-lg bg-raised">
+                <FileText className="h-5 w-5 text-ink-muted" aria-hidden="true" />
+              </span>
+            )}
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[13px] font-medium">{pending.file.name}</span>
               <span className="mt-0.5 flex items-center gap-1 text-[11px] text-ink-muted">
@@ -206,7 +219,7 @@ export const Composer = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept={ACCEPTED_IMAGE_TYPES.join(',')}
+            accept={ACCEPTED_ATTACHMENT_TYPES.join(',')}
             className="sr-only"
             onChange={(event) => {
               const file = event.target.files?.[0];
@@ -220,8 +233,8 @@ export const Composer = ({
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={!canType || isUploading}
-            aria-label="Attach an encrypted photo"
-            title="Attach an encrypted photo"
+            aria-label="Attach an encrypted file"
+            title="Attach an encrypted file"
             className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full text-ink-muted transition-colors hover:bg-raised hover:text-ink disabled:pointer-events-none disabled:opacity-40"
           >
             {isUploading ? (

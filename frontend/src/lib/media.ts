@@ -9,15 +9,26 @@ import {
   toBase64,
 } from './crypto/primitives';
 import { fetchEncryptedMedia, uploadEncryptedMedia } from './api';
-import type { ImageAttachment } from '../types/chat';
+import type { AttachmentDescriptor, FileAttachment, ImageAttachment } from '../types/chat';
 
-export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const configuredMaxBytes = Number(import.meta.env.VITE_MEDIA_MAX_BYTES);
+export const MAX_ATTACHMENT_BYTES =
+  Number.isSafeInteger(configuredMaxBytes) && configuredMaxBytes > 0
+    ? configuredMaxBytes
+    : DEFAULT_MAX_ATTACHMENT_BYTES;
+export const MAX_IMAGE_BYTES = MAX_ATTACHMENT_BYTES;
 
 /** Downscale target. Keeps uploads small and strips EXIF as a side effect. */
 const MAX_DIMENSION = 1600;
 const JPEG_QUALITY = 0.85;
 
 export const ACCEPTED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+export const ACCEPTED_ATTACHMENT_TYPES = [
+  ...ACCEPTED_IMAGE_TYPES,
+  'application/pdf',
+  'text/plain',
+];
 
 export type PreparedImage = {
   bytes: ArrayBuffer;
@@ -51,12 +62,12 @@ const loadImage = (src: string): Promise<HTMLImageElement> =>
  * through untouched, since a canvas would flatten them to one frame.
  */
 export const prepareImage = async (file: File): Promise<PreparedImage> => {
-  if (!file.type.startsWith('image/')) {
+  if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
     throw new Error('Only image files can be attached.');
   }
 
-  if (file.size > MAX_IMAGE_BYTES) {
-    throw new Error(`Images must be under ${Math.floor(MAX_IMAGE_BYTES / (1024 * 1024))}MB.`);
+  if (file.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`Attachments must be under ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB.`);
   }
 
   const dataUrl = await readAsDataUrl(file);
@@ -108,6 +119,55 @@ export const prepareImage = async (file: File): Promise<PreparedImage> => {
   };
 };
 
+const safeName = (name: string): string => {
+  const leaf = name
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .split('')
+    .filter((character) => {
+      const code = character.charCodeAt(0);
+      return code > 0x1f && code !== 0x7f;
+    })
+    .join('')
+    .trim()
+    .replace(/[. ]+$/g, '');
+  return (leaf && leaf !== '.' && leaf !== '..' ? leaf : 'attachment').slice(0, 120);
+};
+
+/** Validate the small supported document set before reading/encrypting it. */
+const prepareDocument = async (file: File): Promise<{ bytes: ArrayBuffer; mime: FileAttachment['mime'] }> => {
+  if (file.size <= 0) throw new Error('Empty attachments cannot be sent.');
+  if (file.size > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`Attachments must be under ${Math.floor(MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB.`);
+  }
+  const lowerName = file.name.toLowerCase();
+  const bytes = await file.arrayBuffer();
+  const view = new Uint8Array(bytes);
+  const declared = file.type.toLowerCase();
+  const unspecified = !declared || declared === 'application/octet-stream';
+
+  if (lowerName.endsWith('.pdf')) {
+    const signature = new TextDecoder().decode(view.subarray(0, 5));
+    if (signature !== '%PDF-' || (!unspecified && declared !== 'application/pdf')) {
+      throw new Error('The file does not match the supported PDF format.');
+    }
+    return { bytes, mime: 'application/pdf' };
+  }
+  if (lowerName.endsWith('.txt')) {
+    if ((!unspecified && declared !== 'text/plain') || view.includes(0)) {
+      throw new Error('The file does not match the supported plain text format.');
+    }
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    } catch {
+      throw new Error('Plain text attachments must be valid UTF-8.');
+    }
+    return { bytes, mime: 'text/plain' };
+  }
+  throw new Error('Supported attachments are JPEG, PNG, WebP, GIF, PDF, and UTF-8 text.');
+};
+
+export const sanitizeAttachmentName = safeName;
+
 /**
  * Encrypt an image under a fresh key and upload the ciphertext.
  *
@@ -140,6 +200,7 @@ export const encryptAndUploadImage = async (
 
   return {
     kind: 'image',
+    version: 2,
     media_id: uploaded.media_id,
     key: toBase64(contentKey),
     iv: toBase64(iv),
@@ -148,6 +209,32 @@ export const encryptAndUploadImage = async (
     size: prepared.bytes.byteLength,
     width: prepared.width,
     height: prepared.height,
+  };
+};
+
+export const encryptAndUploadAttachment = async (
+  apiUrl: string,
+  chatId: string,
+  token: string,
+  file: File,
+): Promise<AttachmentDescriptor> => {
+  if (ACCEPTED_IMAGE_TYPES.includes(file.type)) {
+    return encryptAndUploadImage(apiUrl, chatId, token, file);
+  }
+  const prepared = await prepareDocument(file);
+  const contentKey = randomBytes(KEY_LEN);
+  const iv = randomBytes(IV_LEN);
+  const ciphertext = await aeadSeal(contentKey, iv, new Uint8Array(prepared.bytes), new Uint8Array(0));
+  const uploaded = await uploadEncryptedMedia(apiUrl, chatId, token, toArrayBuffer(ciphertext));
+  return {
+    kind: 'file',
+    version: 2,
+    media_id: uploaded.media_id,
+    key: toBase64(contentKey),
+    iv: toBase64(iv),
+    mime: prepared.mime,
+    name: safeName(file.name),
+    size: prepared.bytes.byteLength,
   };
 };
 
@@ -172,4 +259,19 @@ export const downloadAndDecryptImage = async (
   const blob = new Blob([toArrayBuffer(plaintext)], { type: attachment.mime });
 
   return URL.createObjectURL(blob);
+};
+
+export const downloadAndDecryptAttachment = async (
+  apiUrl: string,
+  token: string,
+  attachment: AttachmentDescriptor,
+): Promise<Blob> => {
+  const ciphertext = await fetchEncryptedMedia(apiUrl, attachment.media_id, token);
+  const plaintext = await aeadOpen(
+    fromBase64(attachment.key),
+    fromBase64(attachment.iv),
+    new Uint8Array(ciphertext),
+    new Uint8Array(0),
+  );
+  return new Blob([toArrayBuffer(plaintext)], { type: attachment.mime });
 };

@@ -27,6 +27,8 @@ export type ChatMessageEvent = {
  */
 export type ImageAttachment = {
   kind: 'image';
+  /** New descriptors are versioned; missing version is the legacy image format. */
+  version?: 2;
   media_id: string;
   /**
    * Per-attachment content key, base64. Each image gets its own random key rather
@@ -42,6 +44,20 @@ export type ImageAttachment = {
   width?: number;
   height?: number;
 };
+
+/** Version 2 generic file descriptor, encrypted inside the chat message payload. */
+export type FileAttachment = {
+  kind: 'file';
+  version: 2;
+  media_id: string;
+  key: string;
+  iv: string;
+  mime: 'application/pdf' | 'text/plain';
+  name: string;
+  size: number;
+};
+
+export type AttachmentDescriptor = ImageAttachment | FileAttachment;
 
 /**
  * Reference to the message being replied to.
@@ -64,7 +80,7 @@ export type StructuredMessagePayload = {
   _wc: 1;
   kind?: 'message';
   caption: string;
-  attachment?: ImageAttachment;
+  attachment?: AttachmentDescriptor;
   reply_to?: ReplyRef;
 };
 
@@ -192,7 +208,7 @@ export type DisplayMessage = {
   serverMessageId?: string;
   senderId: string;
   body: string;
-  attachment?: ImageAttachment;
+  attachment?: AttachmentDescriptor;
   replyTo?: ReplyRef;
   sentAt: string;
   state: 'sending' | 'sent' | 'failed';

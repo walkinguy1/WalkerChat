@@ -61,7 +61,7 @@ import {
   mergeReactions,
   resolveEnvelope,
 } from './lib/chat';
-import { encryptAndUploadImage } from './lib/media';
+import { encryptAndUploadAttachment } from './lib/media';
 import { clearSearchIndex, indexChatMessages } from './lib/search';
 import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
@@ -89,7 +89,7 @@ import type {
   ChatMessageEvent,
   ChatMessageRecord,
   DisplayMessage,
-  ImageAttachment,
+  AttachmentDescriptor,
   ReactionEvent,
   RealtimeEvent,
   SenderKeyEvent,
@@ -1204,7 +1204,7 @@ const App = () => {
   /** Encrypt, send, and optimistically render one message. */
   const sendEncryptedMessage = async (
     caption: string,
-    attachment?: ImageAttachment,
+    attachment?: AttachmentDescriptor,
     replyRef?: ReplyRef,
   ): Promise<boolean> => {
     if (!activeChat || !currentUser || !peer) {
@@ -1341,7 +1341,7 @@ const App = () => {
    * carrying the (also encrypted) attachment descriptor. The backend stores
    * bytes it cannot read.
    */
-  const handleSendPhoto = async (file: File) => {
+  const handleSendAttachment = async (file: File) => {
     if (!activeChat || !currentUser || !peer || !authToken) {
       return;
     }
@@ -1356,14 +1356,14 @@ const App = () => {
     try {
       // The image gets its own random content key; the descriptor carrying it is then
       // sent inside the ratcheted message below.
-      const attachment = await encryptAndUploadImage(apiUrl, activeChat.id, authToken, file);
+      const attachment = await encryptAndUploadAttachment(apiUrl, activeChat.id, authToken, file);
 
       if (await sendEncryptedMessage(draft.trim(), attachment)) {
         setDraft('');
       }
     } catch (error) {
-      console.error('Encrypted photo send failed.', error);
-      pushToast(error instanceof Error ? error.message : 'Unable to send that photo.');
+      console.error('Encrypted attachment send failed.', error);
+      pushToast(error instanceof Error ? error.message : 'Unable to send that attachment.');
     } finally {
       setIsUploadingPhoto(false);
     }
@@ -1618,7 +1618,8 @@ const App = () => {
           draft={draft}
           onDraftChange={setDraft}
           onSend={() => void handleSend()}
-          onSendPhoto={(file) => void handleSendPhoto(file)}
+          onSendAttachment={(file) => void handleSendAttachment(file)}
+          onAttachmentError={pushToast}
           isSecure={Boolean(sessionManager)}
           isUploading={isUploadingPhoto}
           isSocketOpen={isSocketOpen}
