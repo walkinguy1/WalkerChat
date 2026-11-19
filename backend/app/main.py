@@ -37,8 +37,9 @@ def create_app(config: Settings | None = None) -> FastAPI:
             async with SessionLocal() as session:
                 await seed_demo_data(session, app_settings)
 
-        # Non-fatal: chat still works without object storage, only photos break.
-        await ensure_media_bucket()
+        storage_ready = await ensure_media_bucket()
+        if not storage_ready and app_settings.app_env != "development":
+            raise RuntimeError("Configured object storage is unavailable.")
 
         await manager.startup()
         try:
