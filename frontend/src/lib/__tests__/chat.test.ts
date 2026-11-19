@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { acknowledgeMessage, compareSentAt, mergeMessages } from '../chat';
+import { acknowledgeMessage, belongsToActiveChat, compareSentAt, mergeMessages } from '../chat';
 import type { DisplayMessage } from '../../types/chat';
 
 const message = (overrides: Partial<DisplayMessage>): DisplayMessage => ({
@@ -33,6 +33,14 @@ describe('compareSentAt', () => {
     expect(compareSentAt('not a date', '2026-09-05T10:00:00Z')).toBeGreaterThan(0);
     expect(compareSentAt('2026-09-05T10:00:00Z', 'not a date')).toBeLessThan(0);
     expect(compareSentAt('not a date', 'also not a date')).toBe(0);
+  });
+});
+
+describe('belongsToActiveChat', () => {
+  it('rejects delayed results from the conversation that was just left', () => {
+    expect(belongsToActiveChat('chat-old', 'chat-new')).toBe(false);
+    expect(belongsToActiveChat('chat-new', 'chat-new')).toBe(true);
+    expect(belongsToActiveChat('chat-old', null)).toBe(false);
   });
 });
 
