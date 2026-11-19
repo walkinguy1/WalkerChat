@@ -25,7 +25,7 @@ from app.core.storage import (
 from app.models.media import MediaObject
 from app.models.user import User
 from app.schemas.media import MediaUploadResponse
-from app.services.chat import user_is_chat_member
+from app.services.chat import ensure_chat_delivery_allowed, user_is_chat_member
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 settings = get_settings()
@@ -57,11 +57,13 @@ async def upload_encrypted_media(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> MediaUploadResponse:
-    if not await user_is_chat_member(session, chat_id=chat_id, user_id=current_user.id):
+    try:
+        await ensure_chat_delivery_allowed(session, chat_id=chat_id, sender_id=current_user.id)
+    except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Uploader is not a member of this chat.",
-        )
+            detail="Uploader is not allowed to send in this chat.",
+        ) from exc
 
     await _enforce_upload_rate_limit(current_user.id)
 

@@ -33,6 +33,9 @@ from app.core.security import get_current_user
 from app.models.device import Device
 from app.models.prekey import OneTimePreKey
 from app.models.user import User
+from app.models.chat import Chat, ChatMember, ChatType
+from app.models.contact import Contact
+from app.models.contact import ContactBlock
 
 router = APIRouter(prefix="/api/keys", tags=["keys"])
 settings = get_settings()
@@ -165,6 +168,36 @@ async def _device_for(session: AsyncSession, user: User, device_id: str) -> Devi
     return device
 
 
+async def _may_discover_user(session: AsyncSession, requester: User, target_id: UUID) -> bool:
+    if requester.id == target_id:
+        return True
+    blocked = await session.scalar(
+        select(ContactBlock.blocker_id).where(
+            ((ContactBlock.blocker_id == requester.id) & (ContactBlock.blocked_id == target_id))
+            | ((ContactBlock.blocker_id == target_id) & (ContactBlock.blocked_id == requester.id))
+        ).limit(1)
+    ) is not None
+    low, high = sorted((requester.id, target_id), key=str)
+    if not blocked and await session.get(Contact, {"user_low_id": low, "user_high_id": high}) is not None:
+        return True
+    shared_chats = select(ChatMember.chat_id).where(
+        ChatMember.user_id == requester.id,
+        ChatMember.chat_id.in_(select(ChatMember.chat_id).where(ChatMember.user_id == target_id)),
+    )
+    if await session.scalar(
+        select(Chat.id).where(Chat.type == ChatType.GROUP, Chat.id.in_(shared_chats)).limit(1)
+    ) is not None:
+        return True
+    if blocked:
+        return False
+    return await session.scalar(
+        select(ChatMember.user_id).where(
+            ChatMember.user_id == target_id,
+            ChatMember.chat_id.in_(shared_chats),
+        ).limit(1)
+    ) is not None
+
+
 @router.post("/publish", response_model=PublishKeysResponse)
 async def publish_keys(
     body: PublishKeysRequest,
@@ -286,7 +319,7 @@ async def count_opks(
 @router.get("/{target_user_id}/devices", response_model=list[DeviceSummary])
 async def list_devices(
     target_user_id: UUID,
-    _current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> list[DeviceSummary]:
     """
@@ -295,6 +328,8 @@ async def list_devices(
     Senders need this to know how many copies of a message to produce, and safety
     numbers are computed over the whole set.
     """
+    if not await _may_discover_user(session, current_user, target_user_id):
+        raise HTTPException(status_code=404, detail="User devices not found.")
     devices = (
         await session.scalars(
             select(Device)
@@ -332,6 +367,9 @@ async def claim_prekey_bundles(
     prekeys from the target.
     """
     await enforce_key_claim_rate_limit(request, str(current_user.id))
+
+    if not await _may_discover_user(session, current_user, target_user_id):
+        raise HTTPException(status_code=404, detail="Target user not found.")
 
     if await session.get(User, target_user_id) is None:
         raise HTTPException(

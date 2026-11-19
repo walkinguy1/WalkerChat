@@ -9,6 +9,7 @@ from app.core.config import Settings, get_settings
 from app.core.runtime_state import get_runtime_value, set_runtime_value
 from app.core.security import hash_password
 from app.models import Chat, ChatMember, ChatType, Device, Message, MessageEnvelope, User
+from app.models.contact import ContactBlock
 from app.schemas.chat import (
     BootstrapResponse,
     ChatMessageEvent,
@@ -92,6 +93,7 @@ async def seed_demo_data(
             User(
                 id=active_settings.demo_alice_id,
                 username="alice",
+                username_normalized="alice",
                 password_hash=hash_password(demo_password),
             )
         )
@@ -101,6 +103,7 @@ async def seed_demo_data(
             User(
                 id=active_settings.demo_bob_id,
                 username="bob",
+                username_normalized="bob",
                 password_hash=hash_password(demo_password),
             )
         )
@@ -165,6 +168,16 @@ async def ensure_chat_delivery_allowed(
     """
     if not await user_is_chat_member(session, chat_id=chat_id, user_id=sender_id):
         raise PermissionError("Sender is not a member of this chat.")
+    chat = await session.get(Chat, chat_id)
+    if chat is not None and chat.type == ChatType.DIRECT:
+        members = (await session.scalars(select(ChatMember.user_id).where(ChatMember.chat_id == chat_id))).all()
+        if len(members) == 2 and await session.scalar(
+            select(ContactBlock.blocker_id).where(
+                ((ContactBlock.blocker_id == members[0]) & (ContactBlock.blocked_id == members[1]))
+                | ((ContactBlock.blocker_id == members[1]) & (ContactBlock.blocked_id == members[0]))
+            ).limit(1)
+        ) is not None:
+            raise PermissionError("Messages are disabled for this conversation.")
 
 
 async def ensure_directed_delivery_allowed(
@@ -449,33 +462,37 @@ async def get_bootstrap_data(session: AsyncSession, viewer: User) -> BootstrapRe
 
     membership_rows = (
         await session.execute(
-            select(ChatMember.chat_id, User)
+            select(ChatMember.chat_id, ChatMember.role, User)
             .join(User, User.id == ChatMember.user_id)
             .where(ChatMember.chat_id.in_(chat_ids))
         )
     ).all()
 
     everyone: dict[UUID, User] = {viewer.id: viewer}
-    members_by_chat: dict[UUID, list[User]] = {chat_id: [] for chat_id in chat_ids}
-    for chat_id, user in membership_rows:
-        members_by_chat[chat_id].append(user)
+    members_by_chat: dict[UUID, list[tuple[User, str]]] = {chat_id: [] for chat_id in chat_ids}
+    for chat_id, role, user in membership_rows:
+        members_by_chat[chat_id].append((user, role))
         everyone[user.id] = user
 
     presence = {user_id: await presence_of(user_id) for user_id in everyone}
 
-    def to_member(user: User) -> DemoChatMember:
+    def to_member(user: User, role: str) -> DemoChatMember:
         display_name = display_name_for_user(user)
         return DemoChatMember(
             user_id=user.id,
             username=user.username,
             display_name=display_name,
             initials=build_initials(display_name),
+            role=role,
             presence_state=presence[user.id],
         )
 
     summaries: list[DemoChatSummary] = []
     for chat in chats:
-        members = [to_member(user) for user in members_by_chat.get(chat.id, [])]
+        members = [
+            to_member(user, "OWNER" if chat.created_by == user.id else (role or "MEMBER"))
+            for user, role in members_by_chat.get(chat.id, [])
+        ]
         is_group = chat.type == ChatType.GROUP
         summaries.append(
             DemoChatSummary(
