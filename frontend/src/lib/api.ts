@@ -371,6 +371,63 @@ export type UserProfile = {
   presence_state: 'online' | 'offline';
 };
 
+export type ContactRelations = {
+  contacts: UserProfile[];
+  requests: { id: string; direction: 'incoming' | 'outgoing'; user: UserProfile }[];
+  blocked: UserProfile[];
+};
+
+export const fetchContacts = async (apiUrl: string, token: string): Promise<ContactRelations> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts`, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to load contacts.'));
+  return (await response.json()) as ContactRelations;
+};
+
+export const sendContactRequest = async (apiUrl: string, token: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts/requests`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ user_id: userId }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to send contact request.'));
+};
+
+export const respondContactRequest = async (apiUrl: string, token: string, requestId: string, action: 'accept' | 'reject'): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts/requests/${requestId}/${action}`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to update contact request.'));
+};
+
+export const blockContact = async (apiUrl: string, token: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts/blocks`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ user_id: userId }) });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to block this account.'));
+};
+
+export const unblockContact = async (apiUrl: string, token: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts/blocks/${userId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to unblock this account.'));
+};
+
+export const removeContact = async (apiUrl: string, token: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/contacts/${userId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to remove this contact.'));
+};
+
+export const renameGroup = async (apiUrl: string, token: string, chatId: string, name: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/${chatId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ name }) });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to rename this group.'));
+};
+
+export const addGroupMember = async (apiUrl: string, token: string, chatId: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/${chatId}/members`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ user_id: userId }) });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to add this member.'));
+};
+
+export const removeGroupMember = async (apiUrl: string, token: string, chatId: string, userId: string): Promise<void> => {
+  const response = await fetch(`${apiUrl}/api/chats/${chatId}/members/${userId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(await readErrorMessage(response, 'Unable to remove this member.'));
+};
+
 /** Username-prefix search, so a user can find someone to start a chat with. */
 export const searchUsers = async (
   apiUrl: string,

@@ -147,6 +147,7 @@ class DemoChatMember(BaseModel):
     username: str
     display_name: str
     initials: str
+    role: str = "MEMBER"
     presence_state: Literal["online", "offline"] = "offline"
 
 

@@ -211,6 +211,7 @@ export type BootstrapChatMember = {
   username: string;
   display_name: string;
   initials: string;
+  role: string;
   presence_state: 'online' | 'offline';
 };
 
