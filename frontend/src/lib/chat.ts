@@ -11,6 +11,10 @@ import type {
   StructuredMessagePayload,
 } from '../types/chat';
 
+/** A delayed decrypt may update the view only while its conversation is still active. */
+export const belongsToActiveChat = (messageChatId: string, activeChatId: string | null): boolean =>
+  activeChatId !== null && messageChatId === activeChatId;
+
 /** How much of the quoted message travels with a reply. */
 const REPLY_PREVIEW_LIMIT = 140;
 
