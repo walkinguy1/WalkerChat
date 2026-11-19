@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum as SQLEnum,
     ForeignKey,
+    Index,
     String,
     Text,
     UniqueConstraint,
@@ -42,6 +43,7 @@ class Chat(Base):
 
 class ChatMember(Base):
     __tablename__ = "chat_members"
+    __table_args__ = (Index("ix_chat_members_user_id", "user_id"),)
 
     chat_id = Column(UUID(as_uuid=True), ForeignKey("chats.id"), primary_key=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)

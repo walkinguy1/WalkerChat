@@ -66,9 +66,10 @@ async def register(
 ) -> TokenResponse:
     if settings.app_env != "development":
         raise HTTPException(status_code=404, detail="Not found.")
-    await enforce_auth_rate_limit(request, body.username)
+    username = body.username.strip().lower()
+    await enforce_auth_rate_limit(request, username)
     existing = await session.scalar(
-        select(User).where(User.username == body.username)
+        select(User).where(User.username_normalized == username)
     )
     if existing is not None:
         raise HTTPException(
@@ -79,7 +80,8 @@ async def register(
     # Key material is generated in the browser and published separately via
     # POST /api/keys/publish, so a new account genuinely has no keys yet.
     user = User(
-        username=body.username,
+        username=username,
+        username_normalized=username,
         password_hash=hash_password(body.password),
     )
     session.add(user)
@@ -98,9 +100,10 @@ async def login(
 ) -> TokenResponse:
     if settings.app_env != "development":
         raise HTTPException(status_code=404, detail="Not found.")
-    await enforce_auth_rate_limit(request, body.username)
+    username = body.username.strip().lower()
+    await enforce_auth_rate_limit(request, username)
     user = await session.scalar(
-        select(User).where(User.username == body.username)
+        select(User).where(User.username_normalized == username)
     )
     reserved_demo_user = (
         settings.app_env != "development"
@@ -165,8 +168,9 @@ async def onboard_supabase_identity(
     session: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     identity = await verify_supabase_access_token(credentials.credentials)
-    await enforce_auth_rate_limit(request, body.username)
-    if await session.scalar(select(User.id).where(User.username == body.username)):
+    username = body.username.strip().lower()
+    await enforce_auth_rate_limit(request, username)
+    if await session.scalar(select(User.id).where(User.username_normalized == username)):
         raise HTTPException(status_code=409, detail="Username already taken.")
     if await session.scalar(
         select(User.id).where(User.supabase_subject == identity.subject)
@@ -174,7 +178,8 @@ async def onboard_supabase_identity(
         raise HTTPException(status_code=409, detail="This identity is already linked.")
 
     user = User(
-        username=body.username,
+        username=username,
+        username_normalized=username,
         display_name=(body.display_name or "").strip() or None,
         password_hash=None,
         supabase_subject=identity.subject,
@@ -201,8 +206,9 @@ async def link_existing_account(
 ) -> TokenResponse:
     """Link only after proving both the existing password and Google session."""
     identity = await verify_supabase_access_token(credentials.credentials)
-    await enforce_auth_rate_limit(request, body.username)
-    user = await session.scalar(select(User).where(User.username == body.username))
+    username = body.username.strip().lower()
+    await enforce_auth_rate_limit(request, username)
+    user = await session.scalar(select(User).where(User.username_normalized == username))
     if user is None or not user.password_hash or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid existing account credentials.")
     existing_user_id = await session.scalar(
