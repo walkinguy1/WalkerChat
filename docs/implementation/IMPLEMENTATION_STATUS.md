@@ -1,6 +1,6 @@
 # WalkerChat implementation status
 
-Updated: 2026-10-20
+Updated: 2026-11-19
 
 ## Phase 1: trustworthy baseline and safe configuration
 
@@ -18,11 +18,12 @@ media storage, change the WebSocket event schema, or modify WebRTC implementatio
 |---|---|
 | Frontend | `frontend/src/main.tsx`, `frontend/src/App.tsx`; React/Vite. `frontend/src/lib/auth.ts` adapts Supabase Auth/Google PKCE sessions; `frontend/src/lib/api.ts` exchanges verified provider sessions for WalkerChat API tokens. `SignIn.tsx`, `AuthOnboarding.tsx`, and `VaultUnlock.tsx` handle login, profile setup, and local vault unlock separately. |
 | Backend | `backend/app/main.py` creates the FastAPI app and lifespan; routers live in `backend/app/api/`, models in `backend/app/models/`, and business logic in `backend/app/services/`. Endpoints are async. |
-| PostgreSQL and migrations | SQLAlchemy models in `backend/app/models/`; migrations are `0001_e2ee_baseline.py` and `0002_supabase_identity.py`. The second migration preserves existing `users.id` values and adds nullable Supabase identity/profile fields. `backend/alembic/env.py` takes the database URL from validated app settings. `backend/app/core/database.py` checks for missing model tables at startup. `backend/scripts/check_migration_matches_models.py` compares migration-chain table/column names without a database. |
+| PostgreSQL and migrations | SQLAlchemy models in `backend/app/models/`; migrations are `0001_e2ee_baseline.py`, `0002_supabase_identity.py`, and `0003_contacts_and_chat_admin.py`. The revisions preserve existing `users.id` values; Phase 4 adds normalized usernames and additive contact/block tables without removing chats or messages. `backend/alembic/env.py` takes the database URL from validated app settings. `backend/app/core/database.py` checks for missing model tables at startup. `backend/scripts/check_migration_matches_models.py` compares migration-chain table/column names without a database. |
 | Authentication | `backend/app/api/auth.py` implements development-only username/password auth, Supabase onboarding/session exchange, explicit dual-proof legacy account linking, logout, and WebSocket-ticket issuance. `backend/app/core/supabase_auth.py` verifies Supabase access tokens; `backend/app/core/security.py` maps internal JWTs to local users and handles revocation/tickets. `backend/app/core/rate_limit.py` limits auth and prekey-claim requests. |
 | WebSockets | `backend/app/api/ws.py` handles `/api/ws/chat`; `backend/app/schemas/chat.py` defines the realtime contract; `backend/app/core/ws_manager.py` tracks sockets and uses Redis Pub/Sub; `backend/app/core/runtime_state.py` stores tickets, revocations, and counters. Message routing follows chat membership. |
+| Contact discovery and group authorization | `backend/app/api/chats.py` and `backend/app/services/chat_admin.py` implement username search, contact requests/blocks, direct-chat eligibility, and owner/admin group mutation checks. `backend/app/models/contact.py` defines relationship records. `backend/app/api/keys.py` limits key discovery to self, accepted contacts, or shared chat members; `backend/app/api/media.py` and WebSocket service checks enforce membership and block policy. Frontend workflows live in `frontend/src/components/NewChatDialog.tsx`, `GroupSettingsDialog.tsx`, `frontend/src/lib/api.ts`, and `frontend/src/App.tsx`. |
 | Cryptography | `frontend/src/lib/crypto/` contains X3DH, XEdDSA, Double Ratchet, Sender Keys, fingerprints, and IndexedDB vault storage. The vault uses PBKDF2-HMAC-SHA-256 and AES-GCM in `store.ts`; Phase 3 moved new vaults to account-ID namespaces, versioned vault metadata, verified legacy copies, and serialized shared-tab state changes. Tests are under `frontend/src/lib/crypto/__tests__/`; `docs/CRYPTO.md` describes protocol details and known limits. |
-| Encrypted media | `frontend/src/lib/media.ts` encrypts/prepares images; `backend/app/api/media.py` checks membership and handles upload/download; `backend/app/core/storage.py` connects to MinIO/S3-compatible storage. The server stores opaque bytes and metadata. |
+| Encrypted media | `frontend/src/lib/media.ts` validates and encrypts image/PDF/UTF-8 text attachments with per-file AES-GCM keys; `EncryptedAttachment.tsx` decrypts locally and uses download-first documents. `backend/app/api/media.py` checks chat authorization; `backend/app/core/storage.py` uses MinIO locally or private Supabase Storage S3 in non-development deployments. The server stores opaque bytes and non-sensitive operational metadata only. |
 | Calling | `frontend/src/hooks/useWebRTC.ts` and `frontend/src/components/CallOverlay.tsx` implement the browser call flow. Signaling rides the existing chat WebSocket. `backend/app/api/webrtc.py` serves ICE configuration; the backend does not carry call media. |
 
 ### Configuration and security baseline
@@ -193,3 +194,91 @@ The vault change touches no PostgreSQL/Alembic schema and does not change the ba
 WebSocket/API contracts. No live database, Supabase/Google, Redis, object storage,
 production browser, or deployment check was performed. Exact outcomes and recovery
 limitations are recorded in the Phase 3 handoff document.
+
+## Phase 4: contacts and multi-conversation authorization
+
+**Status: COMPLETE; available automated checks passed. Live integration and deployment
+checks remain unverified.** Username search is bounded, normalized, rate limited, and
+does not return email. Contact requests can be accepted or rejected; accepted contacts
+can be removed, and accounts can be blocked/unblocked. New direct chats and group members require accepted contacts, except the
+explicit development Alice/Bob demo. Existing chat IDs, memberships, and history remain
+intact. Backend policy enforces owner/admin group rename/member changes, blocks prevent
+future direct-chat sends and direct key discovery while preserving shared-group key
+discovery, and the frontend exposes contact and group
+management. Existing thread-scoped message/reaction/reply clearing is retained, and
+late asynchronous decryption results are discarded after a chat switch.
+
+Phase 4's additive forward-only migration is
+`backend/alembic/versions/0003_contacts_and_chat_admin.py`. It preserves existing
+application relationships, backfills a unique lowercase/trimmed username key, and adds
+contacts, contact requests, blocks, constraints, and a membership lookup index. Review
+the conflict preflight and exact migration caveats in
+[phase-04-contacts.md](phase-04-contacts.md); no live database was migrated.
+
+| Check | Result |
+|---|---|
+| Frontend `npm test` | Passed: 13 files, 191 tests. Vitest ran outside the sandbox after its temp-cache atomic rename failed inside it. |
+| Frontend `npm run build` | Passed. Vite warned Browserslist data is about six months old. |
+| Frontend `npm run lint` | Passed. |
+| `backend/.venv/Scripts/python.exe -m pytest -q` | Passed: 48 tests in 3.84 seconds, with mocks/fakes and no live services. |
+| `backend/.venv/Scripts/python.exe -m compileall -q app alembic tests` | Passed. |
+| `backend/.venv/Scripts/python.exe scripts/check_migration_matches_models.py` | Passed: 11 tables, 61 columns. |
+| `backend/.venv/Scripts/alembic.exe upgrade head --sql` | Passed: offline SQL generated for all revisions; no database connection. |
+| Live PostgreSQL, Redis, MinIO, Google OAuth, production browser or deployment | Not run. |
+
+One full frontend run executed alongside other validation tasks timed out in the existing
+`senderKey.test.ts` 5-second case. The isolated full suite passed all 191 tests; this is
+recorded as a timing flake, not a crypto code change.
+
+Phase 4 changed `backend/app/api/auth.py`, `backend/app/api/chats.py`, `backend/app/api/keys.py`,
+`backend/app/api/media.py`, `backend/app/models/__init__.py`, `backend/app/models/chat.py`,
+`backend/app/models/contact.py`, `backend/app/models/user.py`,
+`backend/app/schemas/chat.py`, `backend/app/services/chat.py`,
+`backend/app/services/chat_admin.py`, `backend/alembic/versions/0003_contacts_and_chat_admin.py`,
+`backend/tests/test_phase4_contacts.py`, `frontend/src/App.tsx`,
+`frontend/src/components/ChatHeader.tsx`, `frontend/src/components/GroupSettingsDialog.tsx`,
+`frontend/src/components/NewChatDialog.tsx`, `frontend/src/components/ui/Avatar.tsx`,
+`frontend/src/components/__tests__/contacts.test.tsx`, `frontend/src/lib/api.ts`,
+`frontend/src/types/chat.ts`, `docs/implementation/phase-04-contacts.md`, and this ledger.
+
+Production use remains blocked on a verified database backup/migration run, normalized
+handle conflict review, live PostgreSQL concurrency and authorization integration
+checks, shared Redis, storage, and provider/deployment verification. Group removal
+requires client sender-key rotation; this is a Phase 6 prerequisite, not implemented in
+Phase 4.
+
+## Phase 5: private encrypted attachments
+
+**Status: IMPLEMENTED; all available automated checks passed.** New uploads use the
+Supabase Storage S3-compatible endpoint in staging/production and local MinIO in
+development. Production settings require an explicit HTTPS project S3 endpoint, region,
+server-only credentials, and bucket name; startup fails if the configured bucket is
+unavailable. The app does not create Supabase buckets, publish URLs, or store filenames,
+MIME, IVs, or decryption keys in plaintext server metadata. Existing media rows and
+foreign keys are unchanged. New image descriptors are version 2 while old unversioned
+image descriptors remain readable. Version 2 file descriptors add PDF and UTF-8 plain
+text as download-only formats; Office archives remain unsupported. See
+[phase-05-storage-files.md](phase-05-storage-files.md) for dashboard setup, limits,
+historical object cutover, migration/rollback notes, and security limitations.
+
+| Check | Result |
+|---|---|
+| Frontend `npm test -- --run` | Passed: 14 files, 199 tests. Vitest used an ignored temp directory under `frontend/node_modules` to avoid the sandbox Windows cache-rename restriction. A concurrent run timed out one existing Sender Keys test; the isolated full rerun passed. |
+| Frontend `npm run build` | Passed. Vite noted Browserslist data is seven months old. |
+| Frontend `npm run lint` | Passed. |
+| Backend `python -m pytest -q` | Passed: 58 tests in 4.14 seconds, run from a temporary directory so repository `.env` files were not loaded. |
+| Backend compile (`compileall`) | Passed for `app`, `alembic`, and `tests`. |
+| Backend import (`import app.main`) | Passed from a temporary directory. |
+| `scripts/check_migration_matches_models.py` | Passed: 11 tables, 61 columns; no schema changes were needed. |
+| Alembic `upgrade head --sql` | Passed: offline SQL generated (6,951 bytes); no database connection was made. |
+| `docker compose --env-file .env.example config --quiet` | Passed. |
+| Live PostgreSQL, Redis, MinIO, Supabase Storage, historical object copy, production deployment | Not run. |
+
+Phase 5 changes backend storage configuration/adapter and startup, bounded authorized
+media routes, frontend attachment validation/encryption/serialization/decryption,
+tests, local configuration examples, Compose wiring, and this implementation guide.
+No Alembic migration or destructive cleanup was added. An installation with existing
+MinIO media must copy ciphertext objects under the exact existing keys into the private
+Supabase bucket before changing providers. The current browser reads files into memory;
+the supported ceiling is 8 MiB plaintext, and server-side multipart/resumable upload is
+not implemented. Keep MinIO intact until historical-object migration is verified.

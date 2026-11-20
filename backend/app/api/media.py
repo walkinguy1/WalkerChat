@@ -25,7 +25,7 @@ from app.core.storage import (
 from app.models.media import MediaObject
 from app.models.user import User
 from app.schemas.media import MediaUploadResponse
-from app.services.chat import user_is_chat_member
+from app.services.chat import ensure_chat_delivery_allowed, user_is_chat_member
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 settings = get_settings()
@@ -33,6 +33,19 @@ settings = get_settings()
 # The client adds a 12-byte IV and a 16-byte GCM tag, so allow a little
 # headroom above the configured plaintext ceiling.
 _CIPHERTEXT_OVERHEAD_BYTES = 64
+
+
+async def _read_bounded_upload(file: UploadFile, limit: int) -> bytes:
+    """Read chunks and retain at most limit + 1 bytes."""
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        chunk = await file.read(min(64 * 1024, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 async def _enforce_upload_rate_limit(user_id: uuid.UUID) -> None:
@@ -57,16 +70,18 @@ async def upload_encrypted_media(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> MediaUploadResponse:
-    if not await user_is_chat_member(session, chat_id=chat_id, user_id=current_user.id):
+    try:
+        await ensure_chat_delivery_allowed(session, chat_id=chat_id, sender_id=current_user.id)
+    except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Uploader is not a member of this chat.",
-        )
+            detail="Uploader is not allowed to send in this chat.",
+        ) from exc
 
     await _enforce_upload_rate_limit(current_user.id)
 
     max_bytes = settings.media_max_bytes + _CIPHERTEXT_OVERHEAD_BYTES
-    payload = await file.read(max_bytes + 1)
+    payload = await _read_bounded_upload(file, max_bytes)
 
     if not payload:
         raise HTTPException(
@@ -76,7 +91,7 @@ async def upload_encrypted_media(
 
     if len(payload) > max_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=(
                 f"Media exceeds the {settings.media_max_bytes // (1024 * 1024)}MB limit."
             ),
@@ -157,5 +172,5 @@ async def download_encrypted_media(
     return Response(
         content=payload,
         media_type="application/octet-stream",
-        headers={"Cache-Control": "private, max-age=3600"},
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
     )

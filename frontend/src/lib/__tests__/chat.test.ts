@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { acknowledgeMessage, compareSentAt, mergeMessages } from '../chat';
+import { acknowledgeMessage, belongsToActiveChat, compareSentAt, decodeMessagePayload, mergeMessages } from '../chat';
 import type { DisplayMessage } from '../../types/chat';
 
 const message = (overrides: Partial<DisplayMessage>): DisplayMessage => ({
@@ -33,6 +33,28 @@ describe('compareSentAt', () => {
     expect(compareSentAt('not a date', '2026-09-05T10:00:00Z')).toBeGreaterThan(0);
     expect(compareSentAt('2026-09-05T10:00:00Z', 'not a date')).toBeLessThan(0);
     expect(compareSentAt('not a date', 'also not a date')).toBe(0);
+  });
+});
+
+describe('belongsToActiveChat', () => {
+  it('rejects delayed results from the conversation that was just left', () => {
+    expect(belongsToActiveChat('chat-old', 'chat-new')).toBe(false);
+    expect(belongsToActiveChat('chat-new', 'chat-new')).toBe(true);
+    expect(belongsToActiveChat('chat-old', null)).toBe(false);
+  });
+});
+
+describe('encrypted attachment payload compatibility', () => {
+  it('continues to read historical unversioned image descriptors', () => {
+    const attachment = { kind: 'image', media_id: 'old', key: 'key', iv: 'iv', mime: 'image/png', name: 'old.png', size: 5 } as const;
+    expect(decodeMessagePayload(JSON.stringify({ _wc: 1, caption: '', attachment }))).toMatchObject({ kind: 'message', attachment });
+  });
+
+  it('reads only version 2 generic document descriptors', () => {
+    const file = { kind: 'file', version: 2, media_id: 'new', key: 'key', iv: 'iv', mime: 'application/pdf', name: 'doc.pdf', size: 10 } as const;
+    expect(decodeMessagePayload(JSON.stringify({ _wc: 1, caption: '', attachment: file }))).toMatchObject({ kind: 'message', attachment: file });
+    const unsupported = decodeMessagePayload(JSON.stringify({ _wc: 1, caption: '', attachment: { ...file, version: 3 } }));
+    expect(unsupported).toMatchObject({ kind: 'message', body: JSON.stringify({ _wc: 1, caption: '', attachment: { ...file, version: 3 } }) });
   });
 });
 

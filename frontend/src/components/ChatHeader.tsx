@@ -1,5 +1,5 @@
 import clsx from 'clsx';
-import { Hash, Lock, Menu, Phone, ShieldAlert, ShieldCheck, Video } from 'lucide-react';
+import { Hash, Lock, Menu, Phone, Settings2, ShieldAlert, ShieldCheck, Video } from 'lucide-react';
 import { Avatar } from './ui/Avatar';
 import { IconButton } from './ui/Button';
 import type { ConnectionState } from '../hooks/useWebSocket';
@@ -19,6 +19,8 @@ interface ChatHeaderProps {
   onStartCall: (media: CallMediaKind) => void;
   onOpenSidebar: () => void;
   onOpenSafetyNumber: () => void;
+  canManageGroup?: boolean;
+  onManageGroup?: () => void;
 }
 
 const connectionCopy: Record<ConnectionState, string> = {
@@ -44,6 +46,8 @@ export const ChatHeader = ({
   onStartCall,
   onOpenSidebar,
   onOpenSafetyNumber,
+  canManageGroup = false,
+  onManageGroup,
 }: ChatHeaderProps) => {
   const isRoom = chat.kind === 'room';
   const isOnline = peerPresence === 'online';
@@ -161,6 +165,7 @@ export const ChatHeader = ({
               key={member.user_id}
               name={member.display_name}
               initials={member.initials}
+              title={`${member.display_name} · ${member.role}`}
               size="xs"
               className={clsx('ring-2 ring-panel', index > 0 && '-ml-2')}
             />
@@ -174,6 +179,7 @@ export const ChatHeader = ({
       ) : null}
 
       <div className="flex items-center gap-1">
+        {isRoom && canManageGroup ? <IconButton label="Manage group" onClick={onManageGroup}><Settings2 className="h-4 w-4" aria-hidden="true" /></IconButton> : null}
         <IconButton
           label="Start a voice call"
           disabled={!canCall}

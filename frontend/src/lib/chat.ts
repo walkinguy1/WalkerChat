@@ -2,7 +2,7 @@ import type {
   ChatMessageEvent,
   ChatMessageRecord,
   DisplayMessage,
-  ImageAttachment,
+  AttachmentDescriptor,
   MessageEnvelope,
   ReactionEvent,
   ReactionPayload,
@@ -11,13 +11,17 @@ import type {
   StructuredMessagePayload,
 } from '../types/chat';
 
+/** A delayed decrypt may update the view only while its conversation is still active. */
+export const belongsToActiveChat = (messageChatId: string, activeChatId: string | null): boolean =>
+  activeChatId !== null && messageChatId === activeChatId;
+
 /** How much of the quoted message travels with a reply. */
 const REPLY_PREVIEW_LIMIT = 140;
 
 export const buildReplyRef = (message: DisplayMessage): ReplyRef => ({
   message_id: message.id,
   sender_id: message.senderId,
-  preview: (message.body || (message.attachment ? 'Photo' : '')).slice(
+  preview: (message.body || (message.attachment?.kind === 'image' ? 'Photo' : message.attachment ? 'Attachment' : '')).slice(
     0,
     REPLY_PREVIEW_LIMIT,
   ),
@@ -31,7 +35,7 @@ export const buildReplyRef = (message: DisplayMessage): ReplyRef => ({
  */
 export const encodeMessagePayload = (
   caption: string,
-  attachment?: ImageAttachment,
+  attachment?: AttachmentDescriptor,
   replyTo?: ReplyRef,
 ): string => {
   if (!attachment && !replyTo) {
@@ -67,7 +71,7 @@ export const encodeReactionPayload = (
   } satisfies ReactionPayload);
 
 export type DecodedPayload =
-  | { kind: 'message'; body: string; attachment?: ImageAttachment; replyTo?: ReplyRef }
+  | { kind: 'message'; body: string; attachment?: AttachmentDescriptor; replyTo?: ReplyRef }
   | {
       kind: 'reaction';
       targetMessageId: string;
@@ -107,11 +111,19 @@ export const decodeMessagePayload = (plaintext: string): DecodedPayload => {
     }
 
     const envelope = parsed as StructuredMessagePayload;
-    if (envelope.attachment?.kind === 'image' || envelope.reply_to) {
+    const attachment = envelope.attachment as AttachmentDescriptor | undefined;
+    const validSize = Number.isSafeInteger(attachment?.size) && (attachment?.size ?? -1) >= 0 && (attachment?.size ?? Infinity) <= 8 * 1024 * 1024;
+    const supportedImageMime = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(attachment?.mime ?? '');
+    const supportedAttachment =
+      (attachment?.kind === 'image' && (attachment.version === undefined || attachment.version === 2) && supportedImageMime && validSize) ||
+      (attachment?.kind === 'file' && attachment.version === 2 && ['application/pdf', 'text/plain'].includes(attachment.mime) && validSize)
+        ? attachment
+        : undefined;
+    if (supportedAttachment || envelope.reply_to) {
       return {
         kind: 'message',
         body: envelope.caption ?? '',
-        attachment: envelope.attachment?.kind === 'image' ? envelope.attachment : undefined,
+        attachment: supportedAttachment,
         replyTo: envelope.reply_to,
       };
     }
@@ -125,7 +137,7 @@ export const decodeMessagePayload = (plaintext: string): DecodedPayload => {
 export const createOptimisticDisplayMessage = (
   body: string,
   message: ChatMessageEvent,
-  attachment?: ImageAttachment,
+  attachment?: AttachmentDescriptor,
   replyTo?: ReplyRef,
 ): DisplayMessage => ({
   id: message.message_id ?? message.client_message_id,

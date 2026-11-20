@@ -9,6 +9,7 @@ interface AvatarProps {
   size?: AvatarSize;
   presence?: 'online' | 'offline' | null;
   className?: string;
+  title?: string;
 }
 
 const sizeClasses: Record<AvatarSize, string> = {
@@ -67,6 +68,7 @@ export const Avatar = ({
   size = 'md',
   presence = null,
   className,
+  title,
 }: AvatarProps) => {
   const hue = hueFor(name);
   // The gradient's far stop skips the reserved band too, so no avatar fades
@@ -79,7 +81,7 @@ export const Avatar = ({
   })();
 
   return (
-    <span className={clsx('relative inline-flex flex-shrink-0', className)}>
+    <span className={clsx('relative inline-flex flex-shrink-0', className)} title={title}>
       <span
         aria-hidden="true"
         className={clsx(

@@ -85,13 +85,18 @@ class Settings(BaseSettings):
     one_time_prekey_low_water: int = 20
     one_time_prekey_max_stored: int = 200
 
-    # Local MinIO defaults are development-only; non-development modes reject them.
+    # MinIO is the explicit local adapter. Non-development modes use Supabase S3.
+    storage_backend: Literal["minio", "supabase"] = "minio"
+    supabase_storage_endpoint: str | None = None
+    supabase_storage_region: str | None = None
+    supabase_storage_access_key: str | None = None
+    supabase_storage_secret_key: str | None = None
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "minioadmin"
     minio_secret_key: str = "minioadmin"
     minio_secure: bool = False
-    media_bucket: str = "walkerchat-media"
-    media_max_bytes: int = 8 * 1024 * 1024
+    media_bucket: str | None = None
+    media_max_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
     media_rate_limit_uploads: int = 20
     media_rate_limit_window_seconds: int = 60
 
@@ -217,22 +222,36 @@ class Settings(BaseSettings):
                 "service outside development."
             )
 
-        storage_host = _host_from_url(f"//{self.minio_endpoint}")
+        if self.storage_backend != "supabase":
+            raise ValueError("STORAGE_BACKEND must be supabase outside development.")
+        storage_parts = urlsplit(self.supabase_storage_endpoint or "")
+        storage_host = (storage_parts.hostname or "").lower()
+        auth_project_ref = (supabase_parts.hostname or "").split(".")[0]
+        storage_project_ref = storage_host.split(".")[0]
+        access_key = self.supabase_storage_access_key or ""
+        secret_key = self.supabase_storage_secret_key or ""
+        bucket_name = (self.media_bucket or "").strip().lower()
         if (
-            not storage_host
-            or "://" in self.minio_endpoint
-            or storage_host.lower() in _LOCAL_HOSTS
-            or not self.minio_access_key
-            or _contains_placeholder(self.minio_access_key)
-            or len(self.minio_secret_key) < 16
-            or len(set(self.minio_secret_key)) < 8
-            or _contains_placeholder(self.minio_secret_key)
-            or not self.minio_secure
+            storage_parts.scheme != "https"
+            or not storage_host.endswith(".storage.supabase.co")
+            or storage_project_ref != auth_project_ref
+            or storage_parts.path != "/storage/v1/s3"
+            or storage_parts.query
+            or storage_parts.fragment
+            or not self.supabase_storage_region
+            or _contains_placeholder(self.supabase_storage_region)
+            or not access_key
+            or _contains_placeholder(access_key)
+            or len(secret_key) < 16
+            or len(set(secret_key)) < 8
+            or _contains_placeholder(secret_key)
+            or not bucket_name
+            or bucket_name.startswith(("your-", "example", "placeholder"))
         ):
             raise ValueError(
-                "MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, and "
-                "MINIO_SECURE must be explicitly configured for non-development "
-                "use."
+                "SUPABASE_STORAGE_ENDPOINT, SUPABASE_STORAGE_REGION, "
+                "SUPABASE_STORAGE_ACCESS_KEY, SUPABASE_STORAGE_SECRET_KEY, and "
+                "MEDIA_BUCKET must be explicitly configured for non-development use."
             )
 
         if not self.cors_origins:

@@ -16,6 +16,7 @@ class User(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username = Column(String, unique=True, index=True, nullable=False)
+    username_normalized = Column(String, unique=True, index=True, nullable=True)
     password_hash = Column(String, nullable=True)
     display_name = Column(String, nullable=True)
     supabase_subject = Column(String(255), unique=True, index=True, nullable=True)

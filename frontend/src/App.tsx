@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import clsx from 'clsx';
 import {
   fetchBootstrap,
+  fetchContacts,
+  blockContact,
+  addGroupMember,
   fetchHistory,
   fetchIceConfig,
   claimPrekeyBundle,
@@ -17,6 +20,12 @@ import {
   logout,
   publishKeys,
   searchUsers,
+  sendContactRequest,
+  respondContactRequest,
+  unblockContact,
+  removeGroupMember,
+  removeContact,
+  renameGroup,
   uploadOneTimePreKeys,
   type WalkerChatTokenResponse,
 } from './lib/api';
@@ -42,6 +51,7 @@ import {
 import { GroupSessionManager, decodeDistribution } from './lib/crypto/groups';
 import {
   buildReactionTallies,
+  belongsToActiveChat,
   buildReplyRef,
   acknowledgeMessage,
   createOptimisticDisplayMessage,
@@ -51,7 +61,7 @@ import {
   mergeReactions,
   resolveEnvelope,
 } from './lib/chat';
-import { encryptAndUploadImage } from './lib/media';
+import { encryptAndUploadAttachment } from './lib/media';
 import { clearSearchIndex, indexChatMessages } from './lib/search';
 import { pushToast, clearToasts } from './lib/toast';
 import { useWebSocket } from './hooks/useWebSocket';
@@ -69,6 +79,7 @@ import { CommandPalette } from './components/CommandPalette';
 import { Lightbox, type LightboxImage } from './components/Lightbox';
 import { SafetyNumberDialog } from './components/SafetyNumberDialog';
 import { NewChatDialog } from './components/NewChatDialog';
+import { GroupSettingsDialog } from './components/GroupSettingsDialog';
 import { useSafetyNumber } from './hooks/useSafetyNumber';
 import { Toaster } from './components/ui/Toaster';
 import { Logo } from './components/ui/Logo';
@@ -78,7 +89,7 @@ import type {
   ChatMessageEvent,
   ChatMessageRecord,
   DisplayMessage,
-  ImageAttachment,
+  AttachmentDescriptor,
   ReactionEvent,
   RealtimeEvent,
   SenderKeyEvent,
@@ -95,6 +106,8 @@ const App = () => {
   const [bootstrap, setBootstrap] = useState<BootstrapResponse | null>(null);
   const [selectedUserId, setSelectedUserId] = useState<string | null>(null);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const activeChatIdRef = useRef<string | null>(activeChatId);
+  activeChatIdRef.current = activeChatId;
   const [draft, setDraft] = useState('');
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   /** Reaction log for the open thread; folded into tallies below. */
@@ -141,6 +154,7 @@ const App = () => {
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isSafetyNumberOpen, setIsSafetyNumberOpen] = useState(false);
   const [isNewChatOpen, setIsNewChatOpen] = useState(false);
+  const [isGroupSettingsOpen, setIsGroupSettingsOpen] = useState(false);
   /** Peers whose identity key changed during this session. */
   const [changedPeerIds, setChangedPeerIds] = useState<Set<string>>(new Set());
 
@@ -344,7 +358,7 @@ const App = () => {
           }
 
           void decryptEnvelopeRef.current?.(message).then((resolved) => {
-            if (!resolved) {
+            if (!resolved || !belongsToActiveChat(message.chat_id, activeChatIdRef.current)) {
               return;
             }
             if (resolved.kind === 'reaction') {
@@ -499,6 +513,8 @@ const App = () => {
     setMessages([]);
     setReactions([]);
     setReplyTo(null);
+    setDraft('');
+    setIsGroupSettingsOpen(false);
     setHistoryRecords([]);
     setTypingUserId(null);
     setHistoryState(activeChatId ? 'loading' : 'idle');
@@ -1188,7 +1204,7 @@ const App = () => {
   /** Encrypt, send, and optimistically render one message. */
   const sendEncryptedMessage = async (
     caption: string,
-    attachment?: ImageAttachment,
+    attachment?: AttachmentDescriptor,
     replyRef?: ReplyRef,
   ): Promise<boolean> => {
     if (!activeChat || !currentUser || !peer) {
@@ -1325,7 +1341,7 @@ const App = () => {
    * carrying the (also encrypted) attachment descriptor. The backend stores
    * bytes it cannot read.
    */
-  const handleSendPhoto = async (file: File) => {
+  const handleSendAttachment = async (file: File) => {
     if (!activeChat || !currentUser || !peer || !authToken) {
       return;
     }
@@ -1340,14 +1356,14 @@ const App = () => {
     try {
       // The image gets its own random content key; the descriptor carrying it is then
       // sent inside the ratcheted message below.
-      const attachment = await encryptAndUploadImage(apiUrl, activeChat.id, authToken, file);
+      const attachment = await encryptAndUploadAttachment(apiUrl, activeChat.id, authToken, file);
 
       if (await sendEncryptedMessage(draft.trim(), attachment)) {
         setDraft('');
       }
     } catch (error) {
-      console.error('Encrypted photo send failed.', error);
-      pushToast(error instanceof Error ? error.message : 'Unable to send that photo.');
+      console.error('Encrypted attachment send failed.', error);
+      pushToast(error instanceof Error ? error.message : 'Unable to send that attachment.');
     } finally {
       setIsUploadingPhoto(false);
     }
@@ -1494,6 +1510,12 @@ const App = () => {
           open={isNewChatOpen}
           onClose={() => setIsNewChatOpen(false)}
           onSearch={async (query) => (authToken ? searchUsers(apiUrl, authToken, query) : [])}
+          onLoadContacts={async () => (authToken ? fetchContacts(apiUrl, authToken) : { contacts: [], requests: [], blocked: [] })}
+          onRequestContact={async (userId) => { if (authToken) await sendContactRequest(apiUrl, authToken, userId); }}
+          onRespondContact={async (requestId, action) => { if (authToken) await respondContactRequest(apiUrl, authToken, requestId, action); }}
+          onBlockContact={async (userId) => { if (authToken) await blockContact(apiUrl, authToken, userId); }}
+          onUnblockContact={async (userId) => { if (authToken) await unblockContact(apiUrl, authToken, userId); }}
+          onRemoveContact={async (userId) => { if (authToken) await removeContact(apiUrl, authToken, userId); }}
           onCreate={async ({ type, name, memberIds }) => {
             if (!authToken) return;
             try {
@@ -1544,6 +1566,7 @@ const App = () => {
       >
         <Sidebar
           currentUser={currentUser}
+          currentUserRole={activeChat?.members.find((member) => member.user_id === currentUser.id)?.role}
           conversations={conversations}
           activeChatId={activeChatId}
           isSocketOpen={isSocketOpen}
@@ -1573,6 +1596,8 @@ const App = () => {
           onlineCount={onlineMemberCount}
           onStartCall={(media) => void handleStartCall(media)}
           onOpenSidebar={() => setIsSidebarOpen(true)}
+          canManageGroup={activeChat.kind === 'room' && ['OWNER', 'ADMIN'].includes(activeChat.members.find((member) => member.user_id === currentUser.id)?.role ?? '')}
+          onManageGroup={() => setIsGroupSettingsOpen(true)}
         />
 
         <MessageList
@@ -1593,7 +1618,8 @@ const App = () => {
           draft={draft}
           onDraftChange={setDraft}
           onSend={() => void handleSend()}
-          onSendPhoto={(file) => void handleSendPhoto(file)}
+          onSendAttachment={(file) => void handleSendAttachment(file)}
+          onAttachmentError={pushToast}
           isSecure={Boolean(sessionManager)}
           isUploading={isUploadingPhoto}
           isSocketOpen={isSocketOpen}
@@ -1642,6 +1668,12 @@ const App = () => {
         open={isNewChatOpen}
         onClose={() => setIsNewChatOpen(false)}
         onSearch={async (query) => (authToken ? searchUsers(apiUrl, authToken, query) : [])}
+        onLoadContacts={async () => (authToken ? fetchContacts(apiUrl, authToken) : { contacts: [], requests: [], blocked: [] })}
+        onRequestContact={async (userId) => { if (authToken) await sendContactRequest(apiUrl, authToken, userId); }}
+        onRespondContact={async (requestId, action) => { if (authToken) await respondContactRequest(apiUrl, authToken, requestId, action); }}
+        onBlockContact={async (userId) => { if (authToken) await blockContact(apiUrl, authToken, userId); }}
+        onUnblockContact={async (userId) => { if (authToken) await unblockContact(apiUrl, authToken, userId); }}
+        onRemoveContact={async (userId) => { if (authToken) await removeContact(apiUrl, authToken, userId); }}
         onCreate={async ({ type, name, memberIds }) => {
           if (!authToken) return;
           try {
@@ -1660,6 +1692,17 @@ const App = () => {
           }
         }}
       />
+      {isGroupSettingsOpen && activeChat?.kind === 'room' ? (
+        <GroupSettingsDialog
+          chat={activeChat}
+          currentUserId={currentUser.id}
+          onClose={() => setIsGroupSettingsOpen(false)}
+          onLoadContacts={async () => (authToken ? fetchContacts(apiUrl, authToken) : { contacts: [], requests: [], blocked: [] })}
+          onRename={async (name) => { if (!authToken) return; await renameGroup(apiUrl, authToken, activeChat.id, name); setBootstrap(await fetchBootstrap(apiUrl, authToken)); }}
+          onAdd={async (userId) => { if (!authToken) return; await addGroupMember(apiUrl, authToken, activeChat.id, userId); setBootstrap(await fetchBootstrap(apiUrl, authToken)); }}
+          onRemove={async (userId) => { if (!authToken) return; await removeGroupMember(apiUrl, authToken, activeChat.id, userId); setBootstrap(await fetchBootstrap(apiUrl, authToken)); }}
+        />
+      ) : null}
       <SafetyNumberDialog
         open={isSafetyNumberOpen}
         peerName={peer?.display_name ?? 'this contact'}

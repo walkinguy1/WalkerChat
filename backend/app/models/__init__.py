@@ -4,3 +4,4 @@ from .chat import Chat, ChatMember, Message, MessageEnvelope, ChatType, MessageS
 from .media import MediaObject
 from .device import Device
 from .prekey import OneTimePreKey
+from .contact import Contact, ContactBlock, ContactRequest

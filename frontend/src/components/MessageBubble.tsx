@@ -11,7 +11,7 @@ import {
   ShieldOff,
   SmilePlus,
 } from 'lucide-react';
-import { EncryptedImage } from './EncryptedImage';
+import { EncryptedAttachment } from './EncryptedAttachment';
 import { Avatar } from './ui/Avatar';
 import { EmojiPicker } from './ui/EmojiPicker';
 import { formatClock, formatFullTimestamp } from '../lib/format';
@@ -182,7 +182,7 @@ export const MessageBubble = ({
           ) : null}
 
           {message.attachment ? (
-            <EncryptedImage
+            <EncryptedAttachment
               attachment={message.attachment}
               apiUrl={apiUrl}
               authToken={authToken}
